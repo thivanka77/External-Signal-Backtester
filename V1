@@ -1,8 +1,5 @@
-// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
-// © roflmaolk
-
 //@version=5
-strategy("External Signal Backtester", overlay=true)
+strategy("External Dual Signal Backtester", overlay=true)
 
 // === Inputs ===
 exitMode = input.string("Opposite Signal", "Exit Mode", options=["Opposite Signal","Fixed RR"])
@@ -12,32 +9,39 @@ atrPeriod= input.int(14,"ATR Period")
 atrMult  = input.float(2.0,"ATR Multiplier")
 lookbackBars = input.int(5,"Candle Lookback Bars")
 
-src = input.source(title="Signal Source", defval=close)
+buySrc  = input.source(title="Buy Signal Source", defval=close)
+sellSrc = input.source(title="Sell Signal Source", defval=close)
 
 // === Signal Mapping ===
-startLongTrade  = src == 1
-endLongTrade    = src == 2
-startShortTrade = src == -1
-endShortTrade   = src == -2
+startLongTrade  = buySrc == 1
+startShortTrade = sellSrc == 1
 
-// === Entry & Exit ===
+// === Variables to hold SL/TP ===
+var float stopPrice  = na
+var float targetPrice= na
+
+// === Entry ===
 if startLongTrade
     strategy.entry("Long", strategy.long)
     if exitMode == "Fixed RR"
-        stopPrice  = slMode=="ATR" ? close - ta.atr(atrPeriod)*atrMult : ta.lowest(lookbackBars)
-        targetPrice= close + (close - stopPrice)*rrInput
+        stopPrice  := slMode=="ATR" ? close - ta.atr(atrPeriod)*atrMult : open[lookbackBars]
+        targetPrice:= close + (close - stopPrice)*rrInput
         strategy.exit("Long Exit","Long",stop=stopPrice,limit=targetPrice)
 
 if startShortTrade
     strategy.entry("Short", strategy.short)
     if exitMode == "Fixed RR"
-        stopPrice  = slMode=="ATR" ? close + ta.atr(atrPeriod)*atrMult : ta.highest(lookbackBars)
-        targetPrice= close - (stopPrice - close)*rrInput
+        stopPrice  := slMode=="ATR" ? close + ta.atr(atrPeriod)*atrMult : open[lookbackBars]
+        targetPrice:= close - (stopPrice - close)*rrInput
         strategy.exit("Short Exit","Short",stop=stopPrice,limit=targetPrice)
 
-// Opposite Signal Exit Mode
+// === Opposite Signal Exit Mode ===
 if exitMode=="Opposite Signal"
-    if endLongTrade
+    if sellSrc == 1 and strategy.position_size > 0
         strategy.close("Long")
-    if endShortTrade
+    if buySrc == 1 and strategy.position_size < 0
         strategy.close("Short")
+
+// === TP and SL Plots ===
+plot(stopPrice, "Stop Loss", color=color.red, style=plot.style_linebr)
+plot(targetPrice, "Target", color=color.green, style=plot.style_linebr)
