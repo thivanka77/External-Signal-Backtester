@@ -44,9 +44,16 @@ if exitMode=="Opposite Signal"
 
 // --------------- Position sizing ----------- //
 
-// === Risk Inputs ===
-riskAmount   = input.float(100.0, "Fixed Risk Amount (Base Currency)", step=10)
-contractSize = input.float(1.0, "Contract Size", step=0.1, tooltip="Set contract size: XAU=1, Index=100, XAG=1, XTI=1, Forex=1")
+// === Position Sizing Mode Toggle ===
+qtyMode = input.string("Fixed Risk", "Position Sizing Mode",
+     options=["Fixed Risk","Quantity","Cash","Percent of Equity"])
+
+// Inputs for each mode
+riskAmount     = input.float(100.0, "Fixed Risk Amount ($)", step=10)
+contractSize   = input.float(1.0, "Contract Size", step=0.1, tooltip="XAU=1, Index=100, Forex=1")
+fixedQty       = input.float(1.0, "Fixed Quantity (lots)", step=1)
+cashAmount     = input.float(1000.0, "Cash Order Size ($)", step=100)
+percentEquity  = input.float(10.0, "Percent of Equity (%)", step=1)
 
 // --- Stop Loss Calculation (ATR or Candle Lookback) ---
 longStop  = slMode=="ATR" ? close - ta.atr(atrPeriod) * atrMult : open[lookbackBars]
@@ -56,11 +63,29 @@ shortStop = slMode=="ATR" ? close + ta.atr(atrPeriod) * atrMult : open[lookbackB
 longStopDist  = close - longStop
 shortStopDist = shortStop - close
 
-// --- Position Size (lots) ---
-longQty  = longStopDist  > 0 ? riskAmount / (longStopDist  * contractSize) : na
-shortQty = shortStopDist > 0 ? riskAmount / (shortStopDist * contractSize) : na
+// --- Position Size Selection ---
+var float longQty  = na
+var float shortQty = na
 
-// === Entry & Exit (merged with qty) ===
+if qtyMode == "Fixed Risk"
+    longQty  := longStopDist  > 0 ? riskAmount / (longStopDist  * contractSize) : na
+    shortQty := shortStopDist > 0 ? riskAmount / (shortStopDist * contractSize) : na
+
+if qtyMode == "Quantity"
+    longQty  := fixedQty
+    shortQty := fixedQty
+
+if qtyMode == "Cash"
+    longQty  := cashAmount / close
+    shortQty := cashAmount / close
+
+if qtyMode == "Percent of Equity"
+    capital   = strategy.equity
+    riskCash  = capital * percentEquity / 100
+    longQty  := riskCash / close
+    shortQty := riskCash / close
+
+// --- Entries with selected qty ---
 if startLongTrade
     strategy.entry("Long", strategy.long, qty=longQty)
     if exitMode == "Fixed RR"
@@ -74,8 +99,6 @@ if startShortTrade
         stopPrice  := shortStop
         targetPrice:= close - (stopPrice - close) * rrInput
         strategy.exit("Short Exit","Short", stop=stopPrice, limit=targetPrice)
-
-
 
 // ----------- Visual elements -------------- // 
 
