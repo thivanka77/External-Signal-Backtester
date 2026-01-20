@@ -42,6 +42,30 @@ if exitMode=="Opposite Signal"
     if buySrc == 1 and strategy.position_size < 0
         strategy.close("Short")
 
+
+// ----------- Visual elements -------------- // 
+
 // === TP and SL Plots ===
 plot(stopPrice, "Stop Loss", color=color.red, style=plot.style_linebr)
 plot(targetPrice, "Target", color=color.green, style=plot.style_linebr)
+
+
+// === Results Table ===
+var table results = table.new(position.top_right, 4, 2, border_width=1)
+
+if barstate.isrealtime or barstate.islast
+    trades   = strategy.closedtrades
+    net      = strategy.netprofit
+    winRate  = trades > 0 ? (strategy.wintrades * 100.0 / trades) : 0.0
+
+    // Headers
+    table.cell(results, 0, 0, "Trades",   text_color=color.white, bgcolor=color.black)
+    table.cell(results, 1, 0, "Wins",     text_color=color.white, bgcolor=color.black)
+    table.cell(results, 2, 0, "Losses",   text_color=color.white, bgcolor=color.black)
+    table.cell(results, 3, 0, "Win Rate", text_color=color.white, bgcolor=color.black)
+
+    // Values (forced to white text)
+    table.cell(results, 0, 1, str.tostring(trades),   text_color=color.white)
+    table.cell(results, 1, 1, str.tostring(strategy.wintrades), text_color=color.white)
+    table.cell(results, 2, 1, str.tostring(strategy.losstrades), text_color=color.white)
+    table.cell(results, 3, 1, str.tostring(winRate, "#.##") + "%", text_color=color.white)
