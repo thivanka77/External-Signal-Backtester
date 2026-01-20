@@ -1,0 +1,43 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © roflmaolk
+
+//@version=5
+strategy("External Signal Backtester", overlay=true)
+
+// === Inputs ===
+exitMode = input.string("Opposite Signal", "Exit Mode", options=["Opposite Signal","Fixed RR"])
+slMode   = input.string("ATR", "Stop Loss Mode", options=["ATR","Candle Lookback"])
+rrInput  = input.float(2.0,"Risk/Reward",step=0.1)
+atrPeriod= input.int(14,"ATR Period")
+atrMult  = input.float(2.0,"ATR Multiplier")
+lookbackBars = input.int(5,"Candle Lookback Bars")
+
+src = input.source(title="Signal Source", defval=close)
+
+// === Signal Mapping ===
+startLongTrade  = src == 1
+endLongTrade    = src == 2
+startShortTrade = src == -1
+endShortTrade   = src == -2
+
+// === Entry & Exit ===
+if startLongTrade
+    strategy.entry("Long", strategy.long)
+    if exitMode == "Fixed RR"
+        stopPrice  = slMode=="ATR" ? close - ta.atr(atrPeriod)*atrMult : ta.lowest(lookbackBars)
+        targetPrice= close + (close - stopPrice)*rrInput
+        strategy.exit("Long Exit","Long",stop=stopPrice,limit=targetPrice)
+
+if startShortTrade
+    strategy.entry("Short", strategy.short)
+    if exitMode == "Fixed RR"
+        stopPrice  = slMode=="ATR" ? close + ta.atr(atrPeriod)*atrMult : ta.highest(lookbackBars)
+        targetPrice= close - (stopPrice - close)*rrInput
+        strategy.exit("Short Exit","Short",stop=stopPrice,limit=targetPrice)
+
+// Opposite Signal Exit Mode
+if exitMode=="Opposite Signal"
+    if endLongTrade
+        strategy.close("Long")
+    if endShortTrade
+        strategy.close("Short")
