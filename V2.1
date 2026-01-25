@@ -1,0 +1,157 @@
+//@version=5
+strategy("External Signal Backtester", overlay=true, pyramiding=0)
+
+// === Inputs ===
+exitMode = input.string("Opposite Signal", "Exit Mode", options=["Opposite Signal","Fixed RR"])
+slMode   = input.string("ATR", "Stop Loss Mode", options=["ATR","Candle Lookback"])
+rrInput  = input.float(2.0,"Risk/Reward",step=0.1)
+atrPeriod= input.int(14,"ATR Period")
+atrMult  = input.float(2.0,"ATR Multiplier")
+lookbackBars = input.int(5,"Candle Lookback Bars")
+
+buySrc  = input.source(title="Buy Signal Source", defval=close)
+sellSrc = input.source(title="Sell Signal Source", defval=close)
+
+// === Signal Mapping ===
+// Only trigger when the signal turns on (rising edge)
+startLongTrade  = ta.crossover(buySrc, 0)
+startShortTrade = ta.crossover(sellSrc, 0)
+
+
+
+// === Variables to hold SL/TP ===
+var float stopPrice  = na
+var float targetPrice= na
+
+// === Entry ===
+if startLongTrade
+    strategy.entry("Long", strategy.long)
+    if exitMode == "Fixed RR"
+        stopPrice  := slMode=="ATR" ? close - ta.atr(atrPeriod)*atrMult : open[lookbackBars]
+        targetPrice:= close + (close - stopPrice)*rrInput
+        strategy.exit("Long Exit","Long",stop=stopPrice,limit=targetPrice)
+
+if startShortTrade
+    strategy.entry("Short", strategy.short)
+    if exitMode == "Fixed RR"
+        stopPrice  := slMode=="ATR" ? close + ta.atr(atrPeriod)*atrMult : open[lookbackBars]
+        targetPrice:= close - (stopPrice - close)*rrInput
+        strategy.exit("Short Exit","Short",stop=stopPrice,limit=targetPrice)
+
+// === Opposite Signal Exit Mode ===
+if exitMode=="Opposite Signal"
+    if sellSrc == 1 and strategy.position_size > 0
+        strategy.close("Long")
+    if buySrc == 1 and strategy.position_size < 0
+        strategy.close("Short")
+
+// --------------- Position sizing ----------- //
+// === Position Sizing Mode Toggle ===
+qtyMode = input.string("Fixed Risk", "Position Sizing Mode",
+     options=["Fixed Risk","Quantity","Cash","Percent of Equity"],
+     tooltip="Overrides the default order size in Properties")
+
+// Inputs for each mode
+riskAmount     = input.float(100.0, "Fixed Risk Amount ($)", step=10)
+contractSize   = input.float(1.0, "Contract Size", step=0.1, tooltip="XAU=1, Index=100, Forex=1")
+fixedQty       = input.float(1.0, "Fixed Quantity (lots)", step=1)
+cashAmount     = input.float(1000.0, "Cash Order Size ($)", step=100)
+percentEquity  = input.float(10.0, "Percent of Equity (%)", step=1)
+
+// --- Declare stop variables globally ---
+var float longStop  = na
+var float shortStop = na
+
+// --- Position Size Selection ---
+var float longQty  = na
+var float shortQty = na
+
+if exitMode == "Opposite Signal"
+    // Only allow Quantity, Cash, Percent of Equity
+    if qtyMode == "Quantity"
+        longQty  := fixedQty
+        shortQty := fixedQty
+
+    if qtyMode == "Cash"
+        longQty  := cashAmount / close
+        shortQty := cashAmount / close
+
+    if qtyMode == "Percent of Equity"
+        capital   = strategy.equity
+        riskCash  = capital * percentEquity / 100
+        longQty  := riskCash / close
+        shortQty := riskCash / close
+
+if exitMode == "Fixed RR"
+    // Stop Loss Calculation
+    longStop  := slMode=="ATR" ? close - ta.atr(atrPeriod) * atrMult : open[lookbackBars]
+    shortStop := slMode=="ATR" ? close + ta.atr(atrPeriod) * atrMult : open[lookbackBars]
+
+    longStopDist  = close - longStop
+    shortStopDist = shortStop - close
+
+    if qtyMode == "Fixed Risk"
+        longQty  := longStopDist  > 0 ? riskAmount / (longStopDist  * contractSize) : na
+        shortQty := shortStopDist > 0 ? riskAmount / (shortStopDist * contractSize) : na
+
+    if qtyMode == "Quantity"
+        longQty  := fixedQty
+        shortQty := fixedQty
+
+    if qtyMode == "Cash"
+        longQty  := cashAmount / close
+        shortQty := cashAmount / close
+
+    if qtyMode == "Percent of Equity"
+        capital   = strategy.equity
+        riskCash  = capital * percentEquity / 100
+        longQty  := riskCash / close
+        shortQty := riskCash / close
+
+// --- Entries with selected qty ---
+if exitMode == "Opposite Signal"
+    if startLongTrade and strategy.position_size == 0
+        strategy.entry("Long", strategy.long, qty=longQty)
+    if startShortTrade and strategy.position_size == 0
+        strategy.entry("Short", strategy.short, qty=shortQty)
+
+if exitMode == "Fixed RR"
+    if startLongTrade and strategy.position_size == 0
+        strategy.entry("Long", strategy.long, qty=longQty)
+        stopPrice  := longStop
+        targetPrice:= close + (close - stopPrice) * rrInput
+        strategy.exit("Long Exit","Long", stop=stopPrice, limit=targetPrice)
+
+    if startShortTrade and strategy.position_size == 0
+        strategy.entry("Short", strategy.short, qty=shortQty)
+        stopPrice  := shortStop
+        targetPrice:= close - (stopPrice - close) * rrInput
+        strategy.exit("Short Exit","Short", stop=stopPrice, limit=targetPrice)
+
+
+// ----------- Visual elements -------------- // 
+
+// === TP and SL Plots ===
+plot(stopPrice, "Stop Loss", color=color.red, style=plot.style_linebr)
+plot(targetPrice, "Target", color=color.green, style=plot.style_linebr)
+
+
+// === Results Table ===
+var table results = table.new(position.top_right, 4, 2, border_width=1)
+
+if barstate.isrealtime or barstate.islast
+    trades   = strategy.closedtrades
+    net      = strategy.netprofit
+    winRate  = trades > 0 ? (strategy.wintrades * 100.0 / trades) : 0.0
+
+    // Headers
+    table.cell(results, 0, 0, "Trades",   text_color=color.white, bgcolor=color.black)
+    table.cell(results, 1, 0, "Wins",     text_color=color.white, bgcolor=color.black)
+    table.cell(results, 2, 0, "Losses",   text_color=color.white, bgcolor=color.black)
+    table.cell(results, 3, 0, "Win Rate", text_color=color.white, bgcolor=color.black)
+
+    // Values (forced to white text)
+    table.cell(results, 0, 1, str.tostring(trades),   text_color=color.white)
+    table.cell(results, 1, 1, str.tostring(strategy.wintrades), text_color=color.white)
+    table.cell(results, 2, 1, str.tostring(strategy.losstrades), text_color=color.white)
+    table.cell(results, 3, 1, str.tostring(winRate, "#.##") + "%", text_color=color.white)
