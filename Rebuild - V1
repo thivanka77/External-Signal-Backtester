@@ -1,0 +1,84 @@
+//@version=5
+strategy("External Signal Backtester", overlay=true, pyramiding=0)
+var float entryPrice = na
+
+// === Inputs ===
+exitMode  = input.string("Opposite Signal", "Exit Mode", options=["Opposite Signal","Fixed RR"])
+slMode    = input.string("ATR", "Stop Loss Mode", options=["ATR","Candle Lookback"])
+rrInput   = input.float(2.0,"Risk/Reward",step=0.1)
+atrPeriod = input.int(14,"ATR Period")
+atrMult   = input.float(2.0,"ATR Multiplier")
+lookbackBars = input.int(5,"Candle Lookback Bars")
+
+buySrc  = input.source(title="Buy Signal Source", defval=close)
+sellSrc = input.source(title="Sell Signal Source", defval=close)
+
+// === Signal Mapping ===
+startLongTrade  = ta.crossover(buySrc, 0)
+startShortTrade = ta.crossover(sellSrc, 0)
+
+// === Variables to hold SL/TP ===
+var float stopPrice  = na
+var float targetPrice= na
+
+// --- Position Size (simplified: always 1 contract/lot) ---
+var float longQty   = 1.0
+var float shortQty  = 1.0
+var float longStop  = na
+var float shortStop = na
+
+if exitMode == "Fixed RR"
+    longStop  := slMode=="ATR" ? close - ta.atr(atrPeriod) * atrMult : open[lookbackBars]
+    shortStop := slMode=="ATR" ? close + ta.atr(atrPeriod) * atrMult : open[lookbackBars]
+
+// === Entry & Exit Logic ===
+if exitMode == "Opposite Signal"
+    if startLongTrade and strategy.position_size == 0
+        entryPrice := close
+        strategy.entry("Long", strategy.long, qty=longQty)
+
+    if startShortTrade and strategy.position_size == 0
+        entryPrice := close
+        strategy.entry("Short", strategy.short, qty=shortQty)
+
+    // Opposite signal closes trades
+    if sellSrc == 1 and strategy.position_size > 0
+        strategy.close("Long")
+    if buySrc == 1 and strategy.position_size < 0
+        strategy.close("Short")
+
+if exitMode == "Fixed RR"
+    if startLongTrade and strategy.position_size == 0
+        entryPrice := close
+        strategy.entry("Long", strategy.long, qty=longQty)
+        stopPrice  := longStop
+        targetPrice:= close + (close - stopPrice) * rrInput
+        strategy.exit("Long Exit", "Long", stop=stopPrice, limit=targetPrice)
+
+    if startShortTrade and strategy.position_size == 0
+        entryPrice := close
+        strategy.entry("Short", strategy.short, qty=shortQty)
+        stopPrice  := shortStop
+        targetPrice:= close - (stopPrice - close) * rrInput
+        strategy.exit("Short Exit", "Short", stop=stopPrice, limit=targetPrice)
+
+// === Entry & Exit Arrows ===
+plotshape(strategy.opentrades > 0 and strategy.opentrades == strategy.opentrades[1] + 1,
+     title="Entry Arrow",
+     style=shape.triangleup,
+     location=location.belowbar,
+     color=color.green,
+     size=size.small,
+     text="Entry")
+
+plotshape(strategy.closedtrades > 0 and strategy.closedtrades == strategy.closedtrades[1] + 1,
+     title="Exit Arrow",
+     style=shape.triangledown,
+     location=location.abovebar,
+     color=color.red,
+     size=size.small,
+     text="Exit")
+
+// ----------- Visual elements -------------- // 
+plot(stopPrice, "Stop Loss", color=color.red, style=plot.style_linebr)
+plot(targetPrice, "Target", color=color.green, style=plot.style_linebr)
