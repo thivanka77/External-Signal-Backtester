@@ -1,0 +1,247 @@
+//@version=5
+strategy("External Signal Backtester", overlay=true, pyramiding=0)
+
+// === Inputs ===
+showStats = input.bool(true, "Show Stats Table")
+exitMode = input.string("Opposite Signal", "Exit Mode", options=["Opposite Signal","Fixed RR"])
+slMode   = input.string("ATR", "Stop Loss Mode", options=["ATR","Candle Lookback"])
+rrInput  = input.float(2.0,"Risk/Reward",step=0.1)
+atrPeriod= input.int(14,"ATR Period")
+atrMult  = input.float(2.0,"ATR Multiplier")
+lookbackBars = input.int(5,"Candle Lookback Bars")
+
+buySrc  = input.source(title="Buy Signal Source", defval=close)
+sellSrc = input.source(title="Sell Signal Source", defval=close)
+
+// --- Trade Stats Variables ---
+var int   totalTrades       = 0
+var int   totalWins         = 0
+var int   totalLosses       = 0
+var float totalGain         = 0.0
+var float totalLoss         = 0.0
+var float totalReturn       = 0.0
+var float maxDrawdown       = 0.0
+var int   maxDrawdownCount  = 0
+var int   currentLossStreak = 0
+var float maxGainTrade      = 0.0
+var float maxLossTrade      = 0.0
+
+
+
+// === Signal Mapping ===
+// Only trigger when the signal turns on (rising edge)
+startLongTrade  = ta.crossover(buySrc, 0)
+startShortTrade = ta.crossover(sellSrc, 0)
+
+
+
+// === Variables to hold SL/TP ===
+var float stopPrice  = na
+var float targetPrice= na
+
+
+// === Entry ===
+if startLongTrade
+    strategy.entry("Long", strategy.long)
+    if exitMode == "Fixed RR"
+        stopPrice  := slMode=="ATR" ? close - ta.atr(atrPeriod)*atrMult : open[lookbackBars]
+        targetPrice:= close + (close - stopPrice)*rrInput
+        strategy.exit("Long Exit","Long",stop=stopPrice,limit=targetPrice)
+
+if startShortTrade
+    strategy.entry("Short", strategy.short)
+    if exitMode == "Fixed RR"
+        stopPrice  := slMode=="ATR" ? close + ta.atr(atrPeriod)*atrMult : open[lookbackBars]
+        targetPrice:= close - (stopPrice - close)*rrInput
+        strategy.exit("Short Exit","Short",stop=stopPrice,limit=targetPrice)
+
+// === Opposite Signal Exit Mode ===
+if exitMode=="Opposite Signal"
+    if sellSrc == 1 and strategy.position_size > 0
+        strategy.close("Long")
+    if buySrc == 1 and strategy.position_size < 0
+        strategy.close("Short")
+
+// --------------- Position sizing ----------- //
+// === Position Sizing Mode Toggle ===
+qtyMode = input.string("Fixed Risk", "Position Sizing Mode",
+     options=["Fixed Risk","Quantity","Cash","Percent of Equity"],
+     tooltip="Overrides the default order size in Properties")
+
+// Inputs for each mode
+riskAmount     = input.float(100.0, "Fixed Risk Amount ($)", step=10)
+contractSize   = input.float(1.0, "Contract Size", step=0.1, tooltip="XAU=1, Index=100, Forex=1")
+fixedQty       = input.float(1.0, "Fixed Quantity (lots)", step=1)
+cashAmount     = input.float(1000.0, "Cash Order Size ($)", step=100)
+percentEquity  = input.float(10.0, "Percent of Equity (%)", step=1)
+
+// --- Declare stop variables globally ---
+var float longStop  = na
+var float shortStop = na
+
+// --- Position Size Selection ---
+var float longQty  = na
+var float shortQty = na
+
+if exitMode == "Opposite Signal"
+    // Only allow Quantity, Cash, Percent of Equity
+    if qtyMode == "Quantity"
+        longQty  := fixedQty
+        shortQty := fixedQty
+
+    if qtyMode == "Cash"
+        longQty  := cashAmount / close
+        shortQty := cashAmount / close
+
+    if qtyMode == "Percent of Equity"
+        capital   = strategy.equity
+        riskCash  = capital * percentEquity / 100
+        longQty  := riskCash / close
+        shortQty := riskCash / close
+
+if exitMode == "Fixed RR"
+    // Stop Loss Calculation
+    longStop  := slMode=="ATR" ? close - ta.atr(atrPeriod) * atrMult : open[lookbackBars]
+    shortStop := slMode=="ATR" ? close + ta.atr(atrPeriod) * atrMult : open[lookbackBars]
+
+    longStopDist  = close - longStop
+    shortStopDist = shortStop - close
+
+    if qtyMode == "Fixed Risk"
+        longQty  := longStopDist  > 0 ? riskAmount / (longStopDist  * contractSize) : na
+        shortQty := shortStopDist > 0 ? riskAmount / (shortStopDist * contractSize) : na
+
+    if qtyMode == "Quantity"
+        longQty  := fixedQty
+        shortQty := fixedQty
+
+    if qtyMode == "Cash"
+        longQty  := cashAmount / close
+        shortQty := cashAmount / close
+
+    if qtyMode == "Percent of Equity"
+        capital   = strategy.equity
+        riskCash  = capital * percentEquity / 100
+        longQty  := riskCash / close
+        shortQty := riskCash / close
+
+// --- Entries with selected qty ---
+if exitMode == "Opposite Signal"
+    if startLongTrade and strategy.position_size == 0
+        strategy.entry("Long", strategy.long, qty=longQty)
+    if startShortTrade and strategy.position_size == 0
+        strategy.entry("Short", strategy.short, qty=shortQty)
+
+if exitMode == "Fixed RR"
+    if startLongTrade and strategy.position_size == 0
+        strategy.entry("Long", strategy.long, qty=longQty)
+        stopPrice  := longStop
+        targetPrice:= close + (close - stopPrice) * rrInput
+        strategy.exit("Long Exit","Long", stop=stopPrice, limit=targetPrice)
+
+    if startShortTrade and strategy.position_size == 0
+        strategy.entry("Short", strategy.short, qty=shortQty)
+        stopPrice  := shortStop
+        targetPrice:= close - (stopPrice - close) * rrInput
+        strategy.exit("Short Exit","Short", stop=stopPrice, limit=targetPrice)
+
+
+// ----------- Visual elements -------------- // 
+
+// === TP and SL Plots ===
+plot(stopPrice, "Stop Loss", color=color.red, style=plot.style_linebr)
+plot(targetPrice, "Target", color=color.green, style=plot.style_linebr)
+
+
+// --- Update stats when a trade closes ---
+if strategy.closedtrades > totalTrades
+    // Get profit of the last closed trade in percent
+    tradeProfitValue = strategy.closedtrades.profit(strategy.closedtrades - 1)
+    tradeEntryPrice  = strategy.closedtrades.entry_price(strategy.closedtrades - 1)
+    tradeReturn      = tradeEntryPrice != 0 ? (tradeProfitValue / tradeEntryPrice) : na
+
+    if not na(tradeReturn)
+        totalTrades += 1
+        totalReturn += tradeReturn
+
+        if tradeReturn > 0
+            totalWins += 1
+            totalGain += tradeReturn
+            currentLossStreak := 0
+        else
+            totalLosses += 1
+            totalLoss += math.abs(tradeReturn)
+            currentLossStreak += 1
+            maxDrawdown := math.max(maxDrawdown, math.abs(totalLoss))
+            maxDrawdownCount := math.max(maxDrawdownCount, currentLossStreak)
+
+        maxGainTrade := math.max(maxGainTrade, tradeReturn * 100)
+        maxLossTrade := math.min(maxLossTrade, tradeReturn * 100)
+
+
+// --- Performance Metrics ---
+// Declare all metrics as floats so NA assignment works
+var float winRate   = na
+var float gainPct   = na
+var float lossPct   = na
+var float avgRR     = na
+var float avgReturn = na
+var float netGain   = na
+
+// Calculate metrics safely
+if (totalTrades > 0)
+    winRate   := (totalWins * 100.0) / totalTrades
+    avgReturn := (totalReturn / totalTrades) * 100
+
+if (totalLosses > 0)
+    avgRR     := (totalGain / totalLoss)
+
+if (totalWins > 0)
+    gainPct   := totalGain * 100
+
+if (totalLosses > 0)
+    lossPct   := totalLoss * 100
+
+if (not na(gainPct)) and (not na(lossPct))
+    netGain   := gainPct - lossPct
+
+
+
+// === Stats Table ===
+var table statsTable = na
+if showStats and na(statsTable)
+    statsTable := table.new(position.top_right, 2, 12, border_width=1)
+
+if barstate.islast and showStats
+    table.cell(statsTable, 0, 1, "Win Rate %", text_color=color.white)
+    table.cell(statsTable, 1, 1, str.tostring(winRate, "#.##") + "%", text_color=color.white)
+
+    table.cell(statsTable, 0, 2, "Gain %", text_color=color.white)
+    table.cell(statsTable, 1, 2, str.tostring(gainPct, "#.##") + "%", text_color=color.white)
+
+    table.cell(statsTable, 0, 3, "Loss %", text_color=color.white)
+    table.cell(statsTable, 1, 3, str.tostring(lossPct, "#.##") + "%", text_color=color.white)
+
+    table.cell(statsTable, 0, 4, "Avg RR", text_color=color.white)
+    table.cell(statsTable, 1, 4, str.tostring(avgRR, "#.##"), text_color=color.white)
+
+    table.cell(statsTable, 0, 5, "Avg Return %", text_color=color.white)
+    table.cell(statsTable, 1, 5, str.tostring(avgReturn, "#.##") + "%", text_color=color.white)
+
+    table.cell(statsTable, 0, 6, "Trades (W|L)", text_color=color.white)
+    table.cell(statsTable, 1, 6, str.tostring(totalTrades, "#") + " (" + str.tostring(totalWins, "#") + "|" + str.tostring(totalLosses, "#") + ")", text_color=color.white)
+
+    table.cell(statsTable, 0, 7, "Net Gain %", text_color=color.white)
+    table.cell(statsTable, 1, 7, str.tostring(netGain, "#.##") + "%", text_color=color.white)
+
+    table.cell(statsTable, 0, 8, "Max Drawdown %", text_color=color.white)
+    table.cell(statsTable, 1, 8, str.tostring(maxDrawdown * 100, "#.##") + "%", text_color=color.white)
+
+    table.cell(statsTable, 0, 9, "Max Drawdown Count", text_color=color.white)
+    table.cell(statsTable, 1, 9, str.tostring(maxDrawdownCount, "#"), text_color=color.white)
+
+    table.cell(statsTable, 0, 10, "Max Gain % (Trade)", text_color=color.white)
+    table.cell(statsTable, 1, 10, str.tostring(maxGainTrade, "#.##") + "%", text_color=color.white)
+
+    table.cell(statsTable, 0, 11, "Max Loss % (Trade)", text_color=color.white)
+    table.cell(statsTable, 1, 11, str.tostring(maxLossTrade, "#.##") + "%", text_color=color.white)
