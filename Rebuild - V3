@@ -5,13 +5,16 @@ var float entryPrice = na
 
 // === Inputs ===
 exitMode     = input.string("Opposite Signal", "Exit Mode", options=["Opposite Signal","Fixed RR"])
-slMode       = input.string("ATR", "Stop Loss Mode", options=["ATR","Candle Lookback","Swing High/Low"])
+slMode       = input.string("ATR", "Stop Loss Mode", options=["ATR","Candle Lookback","Swing High/Low","Structure"])
 rrInput      = input.float(2.0,"Risk/Reward",step=0.1)
 atrPeriod    = input.int(14,"ATR Period")
 atrMult      = input.float(2.0,"ATR Multiplier")
 lookbackBars = input.int(5,"Candle Lookback Bars")
 swingLen     = input.int(5,"Swing Length (bars)")
-swingMargin  = input.float(0.5,"Swing Margin (points)")   // NEW safety margin
+swingMargin  = input.float(0.5,"Swing Margin (points)")
+pivotLeft    = input.int(2,"Pivot Left Bars")
+pivotRight   = input.int(2,"Pivot Right Bars")
+
 
 
 buySrc  = input.source(title="Buy Signal Source", defval=close)
@@ -34,6 +37,11 @@ var float shortQty = 1.0
 var float longStop  = na
 var float shortStop = na
 
+// Detect recent pivots for structure-based stops
+recentLow  = ta.pivotlow(low, pivotLeft, pivotRight)
+recentHigh = ta.pivothigh(high, pivotLeft, pivotRight)
+
+
 if exitMode == "Fixed RR"
     if slMode == "ATR"
         longStop  := close - ta.atr(atrPeriod) * atrMult
@@ -44,6 +52,12 @@ if exitMode == "Fixed RR"
     else if slMode == "Swing High/Low"
         longStop  := ta.lowest(low, swingLen) - swingMargin
         shortStop := ta.highest(high, swingLen) + swingMargin
+    else if slMode == "Structure"
+        if not na(recentLow)
+            longStop  := recentLow - swingMargin
+        if not na(recentHigh)
+            shortStop := recentHigh + swingMargin
+
 
 
 
