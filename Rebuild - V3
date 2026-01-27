@@ -3,6 +3,26 @@ strategy("External Signal Backtester", overlay=true, pyramiding=0)
 var float entryPrice = na
 
 
+// === External Signal Inputs ===
+buySrc1  = input.source(title="Buy Signal Source 1", defval=close)
+useBuy1  = input.bool(true, "Use Buy Signal 1")
+
+buySrc2  = input.source(title="Buy Signal Source 2", defval=close)
+useBuy2  = input.bool(false, "Use Buy Signal 2")
+
+buySrc3  = input.source(title="Buy Signal Source 3", defval=close)
+useBuy3  = input.bool(false, "Use Buy Signal 3")
+
+sellSrc1 = input.source(title="Sell Signal Source 1", defval=close)
+useSell1 = input.bool(true, "Use Sell Signal 1")
+
+sellSrc2 = input.source(title="Sell Signal Source 2", defval=close)
+useSell2 = input.bool(false, "Use Sell Signal 2")
+
+sellSrc3 = input.source(title="Sell Signal Source 3", defval=close)
+useSell3 = input.bool(false, "Use Sell Signal 3")
+
+
 // === Inputs ===
 exitMode     = input.string("Opposite Signal", "Exit Mode", options=["Opposite Signal","Fixed RR"])
 slMode       = input.string("ATR", "Stop Loss Mode", options=["ATR","Candle Lookback","Swing High/Low","Structure","Moving Average"])
@@ -20,15 +40,31 @@ maType   = input.string("SMA", "MA Type", options=["SMA","EMA","WMA","VWMA","ALM
 maLength = input.int(20, "MA Length")
 
 
-buySrc  = input.source(title="Buy Signal Source", defval=close)
-sellSrc = input.source(title="Sell Signal Source", defval=close)
-
 // === Max Trades Limit ===
 maxTrades = input.int(2, "Max Trades to Show", minval=1)
 
-// === Signal Mapping ===
-startLongTrade  = ta.crossover(buySrc, 0)
-startShortTrade = ta.crossover(sellSrc, 0)
+// === Signal Mapping with Confluences ===
+// Each signal is optional, controlled by its toggle
+condBuy1  = useBuy1  and ta.crossover(buySrc1, 0)
+condBuy2  = useBuy2  and ta.crossover(buySrc2, 0)
+condBuy3  = useBuy3  and ta.crossover(buySrc3, 0)
+
+condSell1 = useSell1 and ta.crossover(sellSrc1, 0)
+condSell2 = useSell2 and ta.crossover(sellSrc2, 0)
+condSell3 = useSell3 and ta.crossover(sellSrc3, 0)
+
+// Final confluence
+// Long confluence
+startLongTrade = (not useBuy1 or ta.crossover(buySrc1, 0)) and
+                 (not useBuy2 or ta.crossover(buySrc2, 0)) and
+                 (not useBuy3 or ta.crossover(buySrc3, 0))
+
+// Short confluence
+startShortTrade = (not useSell1 or ta.crossover(sellSrc1, 0)) and
+                  (not useSell2 or ta.crossover(sellSrc2, 0)) and
+                  (not useSell3 or ta.crossover(sellSrc3, 0))
+
+
 
 // === Variables to hold SL/TP ===
 var float stopPrice   = na
@@ -92,11 +128,13 @@ if exitMode == "Opposite Signal"
         entryPrice := close
         strategy.entry("Short", strategy.short, qty=shortQty)
 
-    // Opposite signal closes trades
-    if sellSrc == 1 and strategy.position_size > 0
+   
+    // Opposite signal closes trades (using primary signal #1)
+    if sellSrc1 == 1 and strategy.position_size > 0
         strategy.close("Long")
-    if buySrc == 1 and strategy.position_size < 0
+    if buySrc1 == 1 and strategy.position_size < 0
         strategy.close("Short")
+
 
 if exitMode == "Fixed RR"
     if startLongTrade and strategy.position_size == 0
