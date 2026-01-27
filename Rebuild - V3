@@ -5,7 +5,7 @@ var float entryPrice = na
 
 // === Inputs ===
 exitMode     = input.string("Opposite Signal", "Exit Mode", options=["Opposite Signal","Fixed RR"])
-slMode       = input.string("ATR", "Stop Loss Mode", options=["ATR","Candle Lookback","Swing High/Low","Structure"])
+slMode       = input.string("ATR", "Stop Loss Mode", options=["ATR","Candle Lookback","Swing High/Low","Structure","Moving Average"])
 rrInput      = input.float(2.0,"Risk/Reward",step=0.1)
 atrPeriod    = input.int(14,"ATR Period")
 atrMult      = input.float(2.0,"ATR Multiplier")
@@ -15,6 +15,9 @@ swingMargin  = input.float(0.5,"Swing Margin (points)")
 pivotLeft    = input.int(2,"Pivot Left Bars")
 pivotRight   = input.int(2,"Pivot Right Bars")
 
+// Moving Average Stop inputs
+maType   = input.string("SMA", "MA Type", options=["SMA","EMA","WMA","VWMA","ALMA","HMA"])
+maLength = input.int(20, "MA Length")
 
 
 buySrc  = input.source(title="Buy Signal Source", defval=close)
@@ -37,6 +40,18 @@ var float shortQty = 1.0
 var float longStop  = na
 var float shortStop = na
 
+// Function to calculate selected MA
+f_ma(src, length, maType) =>
+    ma = switch maType
+        "SMA"  => ta.sma(src, length)
+        "EMA"  => ta.ema(src, length)
+        "WMA"  => ta.wma(src, length)
+        "VWMA" => ta.vwma(src, length)
+        "ALMA" => ta.alma(src, length, 0.85, 6)
+        "HMA"  => ta.hma(src, length)
+    ma
+
+
 // Detect recent pivots for structure-based stops
 recentLow  = ta.pivotlow(low, pivotLeft, pivotRight)
 recentHigh = ta.pivothigh(high, pivotLeft, pivotRight)
@@ -57,9 +72,14 @@ if exitMode == "Fixed RR"
             longStop  := recentLow - swingMargin
         if not na(recentHigh)
             shortStop := recentHigh + swingMargin
-
-
-
+    else if slMode == "Moving Average"
+        maValue = f_ma(close, maLength, maType)
+        longStop  := maValue
+        shortStop := maValue
+    else if slMode == "Moving Average"
+        maValue = f_ma(close, maLength, maType)
+        longStop  := maValue
+        shortStop := maValue
 
 
 // === Entry & Exit Logic ===
