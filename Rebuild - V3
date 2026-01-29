@@ -194,7 +194,7 @@ plotshape(array.includes(exitBars, bar_index),
 // === Expanded Stats Table (limited to last N trades) ===
 var table statsTable = na
 if na(statsTable)
-    statsTable := table.new(position.top_right, 4, 12, border_width=1)
+    statsTable := table.new(position.top_right, 4, 14, border_width=1)
 
 // Initialize counters
 int   totalWins   = 0
@@ -204,6 +204,12 @@ float netGain     = 0.0
 float gainSum     = 0.0
 float lossSum     = 0.0
 
+// Arrays to collect returns for Sharpe/Sortino
+var float[] returns    = array.new_float()
+var float[] negReturns = array.new_float()
+array.clear(returns)
+array.clear(negReturns)
+
 if strategy.closedtrades > 0
     lastIndex = strategy.closedtrades - 1
     for n = 0 to math.min(lastIndex, maxTrades - 1)
@@ -211,18 +217,40 @@ if strategy.closedtrades > 0
         pl = strategy.closedtrades.profit(tradeIndex)
         totalTrades += 1
         netGain     += pl
+        array.push(returns, pl)
         if pl > 0
             totalWins  += 1
             gainSum    += pl
         else if pl < 0
             totalLosses += 1
             lossSum     += pl
+            array.push(negReturns, pl)
 
 // Derived metrics
 float winRate      = totalTrades > 0 ? (totalWins / totalTrades) * 100 : na
 float avgReturn    = totalTrades > 0 ? (netGain / totalTrades) : na
 float profitFactor = lossSum != 0 ? (gainSum / math.abs(lossSum)) : na
 float expectancy   = totalTrades > 0 ? (netGain / totalTrades) : na
+
+// --- Sharpe Ratio ---
+float meanReturn = array.size(returns) > 0 ? array.sum(returns) / array.size(returns) : na
+float variance   = 0.0
+if array.size(returns) > 1
+    for i = 0 to array.size(returns) - 1
+        variance += math.pow(array.get(returns, i) - meanReturn, 2)
+    variance /= (array.size(returns) - 1)
+float stdev = math.sqrt(variance)
+float sharpe = stdev != 0 ? (meanReturn / stdev) : na
+
+// --- Sortino Ratio ---
+float downsideVar = 0.0
+if array.size(negReturns) > 1
+    float meanNeg = array.sum(negReturns) / array.size(negReturns)
+    for i = 0 to array.size(negReturns) - 1
+        downsideVar += math.pow(array.get(negReturns, i) - meanNeg, 2)
+    downsideVar /= (array.size(negReturns) - 1)
+float downsideDev = math.sqrt(downsideVar)
+float sortino = downsideDev != 0 ? (meanReturn / downsideDev) : na
 
 // Update table headers
 table.cell(statsTable, 0, 0, "Win Rate %",    text_color=color.white, bgcolor=color.black)
@@ -235,6 +263,8 @@ table.cell(statsTable, 2, 2, "Total Losses",  text_color=color.white, bgcolor=co
 table.cell(statsTable, 3, 2, "Total Trades",  text_color=color.white, bgcolor=color.black)
 table.cell(statsTable, 0, 4, "Profit Factor", text_color=color.white, bgcolor=color.black)
 table.cell(statsTable, 1, 4, "Expectancy",    text_color=color.white, bgcolor=color.black)
+table.cell(statsTable, 2, 4, "Sharpe",        text_color=color.white, bgcolor=color.black)
+table.cell(statsTable, 3, 4, "Sortino",       text_color=color.white, bgcolor=color.black)
 
 // Update table values
 table.cell(statsTable, 0, 1, str.tostring(winRate, "#.##"),      text_color=color.green)
@@ -247,3 +277,5 @@ table.cell(statsTable, 2, 3, str.tostring(totalLosses),          text_color=colo
 table.cell(statsTable, 3, 3, str.tostring(totalTrades),          text_color=color.yellow)
 table.cell(statsTable, 0, 5, str.tostring(profitFactor, "#.##"), text_color=color.yellow)
 table.cell(statsTable, 1, 5, str.tostring(expectancy, "#.##"),   text_color=color.yellow)
+table.cell(statsTable, 2, 5, str.tostring(sharpe, "#.##"),       text_color=color.yellow)
+table.cell(statsTable, 3, 5, str.tostring(sortino, "#.##"),      text_color=color.yellow)
