@@ -92,26 +92,40 @@ f_ma(src, length, maType) =>
 recentLow  = ta.pivotlow(low, pivotLeft, pivotRight)
 recentHigh = ta.pivothigh(high, pivotLeft, pivotRight)
 
-
 if exitMode == "Fixed RR"
     if slMode == "ATR"
         longStop  := close - ta.atr(atrPeriod) * atrMult
         shortStop := close + ta.atr(atrPeriod) * atrMult
+
     else if slMode == "Candle Lookback"
         longStop  := ta.lowest(low, lookbackBars)
         shortStop := ta.highest(high, lookbackBars)
+
     else if slMode == "Swing High/Low"
         longStop  := ta.lowest(low, swingLen) - swingMargin
         shortStop := ta.highest(high, swingLen) + swingMargin
+
     else if slMode == "Structure"
-        if not na(recentLow)
-            longStop  := recentLow - swingMargin
-        if not na(recentHigh)
-            shortStop := recentHigh + swingMargin
-    else if slMode == "Moving Average"
-        maValue = f_ma(close, maLength, maType)
-        longStop  := maValue
-        shortStop := maValue
+        // Long trade trailing stop
+        if strategy.position_size > 0
+            if not na(recentLow)
+                newStop = recentLow - swingMargin
+                // Initialize stop at entry or tighten only if new stop is higher
+                if na(longStop)
+                    longStop := newStop
+                else if newStop > longStop
+                    longStop := newStop
+
+        // Short trade trailing stop
+        if strategy.position_size < 0
+            if not na(recentHigh)
+                newStop = recentHigh + swingMargin
+                // Initialize stop at entry or tighten only if new stop is lower
+                if na(shortStop)
+                    shortStop := newStop
+                else if newStop < shortStop
+                    shortStop := newStop
+
     else if slMode == "Moving Average"
         maValue = f_ma(close, maLength, maType)
         longStop  := maValue
@@ -128,7 +142,6 @@ if exitMode == "Opposite Signal"
         entryPrice := close
         strategy.entry("Short", strategy.short, qty=shortQty)
 
-   
     // Opposite signal closes trades (using primary signal #1)
     if sellSrc1 == 1 and strategy.position_size > 0
         strategy.close("Long")
@@ -136,20 +149,51 @@ if exitMode == "Opposite Signal"
         strategy.close("Short")
 
 
+// === Fixed RR Mode ===
 if exitMode == "Fixed RR"
+    // Long entry
     if startLongTrade and strategy.position_size == 0
         entryPrice := close
-        strategy.entry("Long", strategy.long, qty=longQty)
+        // initialize stop at entry
+        if slMode == "Structure" and not na(recentLow)
+            longStop := recentLow - swingMargin
+        else if slMode == "ATR"
+            longStop := close - ta.atr(atrPeriod) * atrMult
+        // add other modes here as needed...
         stopPrice  := longStop
         targetPrice:= close + (close - stopPrice) * rrInput
+        strategy.entry("Long", strategy.long, qty=longQty)
         strategy.exit("Long Exit", "Long", stop=stopPrice, limit=targetPrice)
 
+    // Short entry
     if startShortTrade and strategy.position_size == 0
         entryPrice := close
-        strategy.entry("Short", strategy.short, qty=shortQty)
+        // initialize stop at entry
+        if slMode == "Structure" and not na(recentHigh)
+            shortStop := recentHigh + swingMargin
+        else if slMode == "ATR"
+            shortStop := close + ta.atr(atrPeriod) * atrMult
+        // add other modes here as needed...
         stopPrice  := shortStop
         targetPrice:= close - (stopPrice - close) * rrInput
+        strategy.entry("Short", strategy.short, qty=shortQty)
         strategy.exit("Short Exit", "Short", stop=stopPrice, limit=targetPrice)
+
+    // While in trade, update trailing stops (Structure mode logic)
+    if strategy.position_size > 0 and slMode == "Structure"
+        if not na(recentLow)
+            newStop = recentLow - swingMargin
+            if na(longStop) or newStop > longStop
+                longStop := newStop
+                strategy.exit("Long Exit", "Long", stop=longStop, limit=targetPrice)
+
+    if strategy.position_size < 0 and slMode == "Structure"
+        if not na(recentHigh)
+            newStop = recentHigh + swingMargin
+            if na(shortStop) or newStop < shortStop
+                shortStop := newStop
+                strategy.exit("Short Exit", "Short", stop=shortStop, limit=targetPrice)
+
 
 // ----------- Visual elements -------------- // 
 plot(stopPrice, "Stop Loss", color=color.red, style=plot.style_linebr)
