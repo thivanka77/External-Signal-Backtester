@@ -25,7 +25,7 @@ useSell3 = input.bool(false, "Use Sell Signal 3")
 
 // === Inputs ===
 exitMode     = input.string("Opposite Signal", "Exit Mode", options=["Opposite Signal","Fixed RR"])
-slMode       = input.string("Candle Lookback", "Stop Loss Mode", options=["Candle Lookback","Swing High/Low","Structure","Moving Average"])
+slMode       = input.string("Candle Lookback", "Stop Loss Mode", options=["Candle Lookback","Swing High/Low","Moving Average"])
 rrInput      = input.float(2.0,"Risk/Reward",step=0.1)
 lookbackBars = input.int(5,"Candle Lookback Bars")
 swingLen     = input.int(5,"Swing Length (bars)")
@@ -86,9 +86,6 @@ f_ma(src, length, maType) =>
     ma
 
 
-// Detect recent pivots for structure-based stops
-recentLow  = ta.pivotlow(low, pivotLeft, pivotRight)
-recentHigh = ta.pivothigh(high, pivotLeft, pivotRight)
 
 if exitMode == "Fixed RR"
     if slMode == "Candle Lookback"
@@ -99,26 +96,6 @@ if exitMode == "Fixed RR"
         longStop  := ta.lowest(low, swingLen) - swingMargin
         shortStop := ta.highest(high, swingLen) + swingMargin
 
-    else if slMode == "Structure"
-        // Long trade trailing stop
-        if strategy.position_size > 0
-            if not na(recentLow)
-                newStop = recentLow - swingMargin
-                // Initialize stop at entry or tighten only if new stop is higher
-                if na(longStop)
-                    longStop := newStop
-                else if newStop > longStop
-                    longStop := newStop
-
-        // Short trade trailing stop
-        if strategy.position_size < 0
-            if not na(recentHigh)
-                newStop = recentHigh + swingMargin
-                // Initialize stop at entry or tighten only if new stop is lower
-                if na(shortStop)
-                    shortStop := newStop
-                else if newStop < shortStop
-                    shortStop := newStop
 
     else if slMode == "Moving Average"
         maValue = f_ma(close, maLength, maType)
@@ -149,8 +126,7 @@ if exitMode == "Fixed RR"
     if startLongTrade and strategy.position_size == 0
         entryPrice := close
         // initialize stop at entry
-        if slMode == "Structure" and not na(recentLow)
-            longStop := recentLow - swingMargin
+        
         
         // add other modes here as needed...
         stopPrice  := longStop
@@ -162,28 +138,14 @@ if exitMode == "Fixed RR"
     if startShortTrade and strategy.position_size == 0
         entryPrice := close
         // initialize stop at entry
-        if slMode == "Structure" and not na(recentHigh)
-            shortStop := recentHigh + swingMargin
+        
         // add other modes here as needed...
         stopPrice  := shortStop
         targetPrice:= close - (stopPrice - close) * rrInput
         strategy.entry("Short", strategy.short, qty=shortQty)
         strategy.exit("Short Exit", "Short", stop=stopPrice, limit=targetPrice)
 
-    // While in trade, update trailing stops (Structure mode logic)
-    if strategy.position_size > 0 and slMode == "Structure"
-        if not na(recentLow)
-            newStop = recentLow - swingMargin
-            if na(longStop) or newStop > longStop
-                longStop := newStop
-                strategy.exit("Long Exit", "Long", stop=longStop, limit=targetPrice)
-
-    if strategy.position_size < 0 and slMode == "Structure"
-        if not na(recentHigh)
-            newStop = recentHigh + swingMargin
-            if na(shortStop) or newStop < shortStop
-                shortStop := newStop
-                strategy.exit("Short Exit", "Short", stop=shortStop, limit=targetPrice)
+    
 
 
 // ----------- Visual elements -------------- // 
