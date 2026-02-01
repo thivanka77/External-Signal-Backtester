@@ -1,0 +1,290 @@
+//@version=5
+strategy("External Signal Backtester (patched)", overlay=true, pyramiding=0)
+var float entryPrice = na
+
+// === External Signal Inputs ===
+buySrc1  = input.source(title="Buy Signal Source 1", defval=close)
+useBuy1  = input.bool(true, "Use Buy Signal 1")
+
+buySrc2  = input.source(title="Buy Signal Source 2", defval=close)
+useBuy2  = input.bool(false, "Use Buy Signal 2")
+
+buySrc3  = input.source(title="Buy Signal Source 3", defval=close)
+useBuy3  = input.bool(false, "Use Buy Signal 3")
+
+sellSrc1 = input.source(title="Sell Signal Source 1", defval=close)
+useSell1 = input.bool(true, "Use Sell Signal 1")
+
+sellSrc2 = input.source(title="Sell Signal Source 2", defval=close)
+useSell2 = input.bool(false, "Use Sell Signal 2")
+
+sellSrc3 = input.source(title="Sell Signal Source 3", defval=close)
+useSell3 = input.bool(false, "Use Sell Signal 3")
+
+// === Inputs ===
+exitMode     = input.string("Opposite Signal", "Exit Mode", options=["Opposite Signal","Fixed RR"])
+slMode       = input.string("Candle Lookback", "Stop Loss Mode", options=["Candle Lookback","Swing High/Low","Moving Average"])
+rrInput      = input.float(2.0,"Risk/Reward",step=0.1)
+lookbackBars = input.int(5,"Candle Lookback Bars")
+swingLen     = input.int(5,"Swing Length (bars)")
+swingMargin  = input.float(0.5,"Swing Margin (points)")
+pivotLeft    = input.int(2,"Pivot Left Bars")
+pivotRight   = input.int(2,"Pivot Right Bars")
+
+// Moving Average Stop inputs
+maType   = input.string("SMA", "MA Type", options=["SMA","EMA","WMA","VWMA","ALMA","HMA"])
+maLength = input.int(20, "MA Length")
+
+// === Max Trades Limit ===
+maxTrades = input.int(2, "Max Trades to Show", minval=1)
+
+// === Signal Mapping with Confluences ===
+// Each signal is optional, controlled by its toggle
+condBuy1  = useBuy1  and ta.crossover(buySrc1, 0)
+condBuy2  = useBuy2  and ta.crossover(buySrc2, 0)
+condBuy3  = useBuy3  and ta.crossover(buySrc3, 0)
+
+condSell1 = useSell1 and ta.crossover(sellSrc1, 0)
+condSell2 = useSell2 and ta.crossover(sellSrc2, 0)
+condSell3 = useSell3 and ta.crossover(sellSrc3, 0)
+
+// Final confluence
+// Note: we will still require at least one enabled signal when entering (see usage below)
+startLongTrade = (not useBuy1 or ta.crossover(buySrc1, 0)) and
+                 (not useBuy2 or ta.crossover(buySrc2, 0)) and
+                 (not useBuy3 or ta.crossover(buySrc3, 0))
+
+startShortTrade = (not useSell1 or ta.crossover(sellSrc1, 0)) and
+                  (not useSell2 or ta.crossover(sellSrc2, 0)) and
+                  (not useSell3 or ta.crossover(sellSrc3, 0))
+
+// === Variables to hold SL/TP ===
+var float stopPrice   = na
+var float targetPrice = na
+
+// --- Position Size (fixed at 1) ---
+var float longQty  = 1.0
+var float shortQty = 1.0
+var float longStop  = na
+var float shortStop = na
+
+// Function to calculate selected MA
+f_ma(src, length, maType) =>
+    ma = switch maType
+        "SMA"  => ta.sma(src, length)
+        "EMA"  => ta.ema(src, length)
+        "WMA"  => ta.wma(src, length)
+        "VWMA" => ta.vwma(src, length)
+        "ALMA" => ta.alma(src, length, 0.85, 6)
+        "HMA"  => ta.hma(src, length)
+    ma
+
+// Precompute enabled flags
+longEnabled  = useBuy1 or useBuy2 or useBuy3
+shortEnabled = useSell1 or useSell2 or useSell3
+
+// Compute candidate stops for Fixed RR mode (kept updated each bar)
+if exitMode == "Fixed RR"
+    if slMode == "Candle Lookback"
+        longStop  := ta.lowest(low, lookbackBars)
+        shortStop := ta.highest(high, lookbackBars)
+    else if slMode == "Swing High/Low"
+        longStop  := ta.lowest(low, swingLen) - swingMargin
+        shortStop := ta.highest(high, swingLen) + swingMargin
+    else if slMode == "Moving Average"
+        maValue = f_ma(close, maLength, maType)
+        longStop  := maValue
+        shortStop := maValue
+else
+    // Clear stops when not in Fixed RR to avoid stale values
+    longStop  := na
+    shortStop := na
+
+// === Entry & Exit Logic ===
+if exitMode == "Opposite Signal"
+    // Entries require at least one enabled signal on the side to avoid "always true" when all toggles off
+    if longEnabled and startLongTrade and strategy.position_size == 0
+        entryPrice := close
+        strategy.entry("Long", strategy.long, qty=longQty)
+
+    if shortEnabled and startShortTrade and strategy.position_size == 0
+        entryPrice := close
+        strategy.entry("Short", strategy.short, qty=shortQty)
+
+    // Close on opposite *edge* signals (use crossovers for consistency with entries)
+    longCloseSignal  = (useSell1 and ta.crossover(sellSrc1, 0)) or (useSell2 and ta.crossover(sellSrc2, 0)) or (useSell3 and ta.crossover(sellSrc3, 0))
+    shortCloseSignal = (useBuy1  and ta.crossover(buySrc1,  0)) or (useBuy2  and ta.crossover(buySrc2,  0)) or (useBuy3  and ta.crossover(buySrc3,  0))
+
+    if longCloseSignal and strategy.position_size > 0
+        strategy.close("Long")
+    if shortCloseSignal and strategy.position_size < 0
+        strategy.close("Short")
+
+// === Fixed RR Mode ===
+if exitMode == "Fixed RR"
+    // Long entry - require valid stop (stop must be below entry for long)
+    if longEnabled and startLongTrade and strategy.position_size == 0
+        entryPrice := close
+        stopPrice  := longStop
+        // Validate stop is not na and is below entry (close)
+        if not na(stopPrice) and stopPrice < close
+            targetPrice:= close + (close - stopPrice) * rrInput
+            strategy.entry("Long", strategy.long, qty=longQty)
+            strategy.exit("Long Exit", "Long", stop=stopPrice, limit=targetPrice)
+        else
+            // Skip entry if stop invalid - can also alert or adjust if desired
+            stopPrice := na
+            targetPrice := na
+
+    // Short entry - require valid stop (stop must be above entry for short)
+    if shortEnabled and startShortTrade and strategy.position_size == 0
+        entryPrice := close
+        stopPrice  := shortStop
+        if not na(stopPrice) and stopPrice > close
+            targetPrice:= close - (stopPrice - close) * rrInput
+            strategy.entry("Short", strategy.short, qty=shortQty)
+            strategy.exit("Short Exit", "Short", stop=stopPrice, limit=targetPrice)
+        else
+            stopPrice := na
+            targetPrice := na
+
+// ----------- Visual elements -------------- // 
+plot(stopPrice, "Stop Loss", color=color.red, style=plot.style_linebr)
+plot(targetPrice, "Target", color=color.green, style=plot.style_linebr)
+
+// === Entry & Exit Arrows for last N trades ===
+lastIndex = strategy.closedtrades - 1
+
+// Precompute arrays of entry/exit bars for up to maxTrades
+var entryBars = array.new_int()
+var exitBars  = array.new_int()
+
+array.clear(entryBars)
+array.clear(exitBars)
+
+if strategy.closedtrades > 0
+    for n = 0 to math.min(lastIndex, maxTrades - 1)
+        tradeIndex = lastIndex - n
+        entryBar   = strategy.closedtrades.entry_bar_index(tradeIndex)
+        exitBar    = strategy.closedtrades.exit_bar_index(tradeIndex)
+        array.push(entryBars, entryBar)
+        array.push(exitBars, exitBar)
+
+// Plot arrows globally (outside loop)
+plotshape(array.includes(entryBars, bar_index), 
+          title="Entry Arrow", 
+          style=shape.triangleup, 
+          location=location.belowbar, 
+          color=color.green, 
+          size=size.small, 
+          text="Entry")
+
+plotshape(array.includes(exitBars, bar_index), 
+          title="Exit Arrow", 
+          style=shape.triangledown, 
+          location=location.abovebar, 
+          color=color.red, 
+          size=size.small, 
+          text="Exit")
+
+// === Expanded Stats Table (limited to last N trades) ===
+var table statsTable = na
+if na(statsTable)
+    statsTable := table.new(position.top_right, 4, 14, border_width=1)
+
+// Initialize counters
+int   totalWins   = 0
+int   totalLosses = 0
+int   totalTrades = 0
+float netGain     = 0.0
+float gainSum     = 0.0
+float lossSum     = 0.0
+
+// Arrays to collect returns for Sharpe/Sortino
+var float[] returns    = array.new_float()
+var float[] negReturns = array.new_float()
+array.clear(returns)
+array.clear(negReturns)
+
+if strategy.closedtrades > 0
+    lastIndex = strategy.closedtrades - 1
+    for n = 0 to math.min(lastIndex, maxTrades - 1)
+        tradeIndex = lastIndex - n
+        pl = strategy.closedtrades.profit(tradeIndex)
+        // skip invalid profit values (safety)
+        if not na(pl)
+            totalTrades += 1
+            netGain     += pl
+            array.push(returns, pl)
+            if pl > 0
+                totalWins  += 1
+                gainSum    += pl
+            else if pl < 0
+                totalLosses += 1
+                lossSum     += pl
+                array.push(negReturns, pl)
+
+// Derived metrics
+float winRate      = totalTrades > 0 ? (totalWins / totalTrades) * 100 : na
+float avgReturn    = totalTrades > 0 ? (netGain / totalTrades) : na
+float profitFactor = lossSum != 0 ? (gainSum / math.abs(lossSum)) : na
+float expectancy   = totalTrades > 0 ? (netGain / totalTrades) : na
+
+// --- Sharpe Ratio ---
+// robust mean/stdev calculation (avoid array.sum for compatibility)
+float meanReturn = na
+if array.size(returns) > 0
+    float sumR = 0.0
+    for i = 0 to array.size(returns) - 1
+        sumR += array.get(returns, i)
+    meanReturn := sumR / array.size(returns)
+
+float variance = 0.0
+if array.size(returns) > 1
+    for i = 0 to array.size(returns) - 1
+        variance += math.pow(array.get(returns, i) - meanReturn, 2)
+    variance := variance / (array.size(returns) - 1)
+float stdev = math.sqrt(variance)
+float sharpe = stdev != 0 ? (meanReturn / stdev) : na
+
+// --- Sortino Ratio ---
+// compute downside deviation relative to 0 (common definition)
+float downsideSum = 0.0
+int downsideCount = 0
+if array.size(returns) > 0
+    for i = 0 to array.size(returns) - 1
+        r = array.get(returns, i)
+        if r < 0
+            downsideSum += math.pow(r, 2)
+            downsideCount += 1
+
+float downsideDev = downsideCount > 0 ? math.sqrt(downsideSum / downsideCount) : na
+float sortino = downsideDev != 0 ? (meanReturn / downsideDev) : na
+
+// Update table headers
+table.cell(statsTable, 0, 0, "Win Rate %",    text_color=color.white, bgcolor=color.black)
+table.cell(statsTable, 1, 0, "Gain",          text_color=color.white, bgcolor=color.black)
+table.cell(statsTable, 2, 0, "Loss",          text_color=color.white, bgcolor=color.black)
+table.cell(statsTable, 3, 0, "Net Gain",      text_color=color.white, bgcolor=color.black)
+table.cell(statsTable, 0, 2, "Avg Return",    text_color=color.white, bgcolor=color.black)
+table.cell(statsTable, 1, 2, "Total Wins",    text_color=color.white, bgcolor=color.black)
+table.cell(statsTable, 2, 2, "Total Losses",  text_color=color.white, bgcolor=color.black)
+table.cell(statsTable, 3, 2, "Total Trades",  text_color=color.white, bgcolor=color.black)
+table.cell(statsTable, 0, 4, "Profit Factor", text_color=color.white, bgcolor=color.black)
+table.cell(statsTable, 1, 4, "Expectancy",    text_color=color.white, bgcolor=color.black)
+table.cell(statsTable, 2, 4, "Sharpe",        text_color=color.white, bgcolor=color.black)
+table.cell(statsTable, 3, 4, "Sortino",       text_color=color.white, bgcolor=color.black)
+
+// Update table values
+table.cell(statsTable, 0, 1, str.tostring(winRate, "#.##"),      text_color=color.green)
+table.cell(statsTable, 1, 1, str.tostring(gainSum, "#.##"),      text_color=color.green)
+table.cell(statsTable, 2, 1, str.tostring(lossSum, "#.##"),      text_color=color.red)
+table.cell(statsTable, 3, 1, str.tostring(netGain, "#.##"),      text_color=color.yellow)
+table.cell(statsTable, 0, 3, str.tostring(avgReturn, "#.##"),    text_color=color.green)
+table.cell(statsTable, 1, 3, str.tostring(totalWins),            text_color=color.green)
+table.cell(statsTable, 2, 3, str.tostring(totalLosses),          text_color=color.red)
+table.cell(statsTable, 3, 3, str.tostring(totalTrades),          text_color=color.yellow)
+table.cell(statsTable, 0, 5, str.tostring(profitFactor, "#.##"), text_color=color.yellow)
+table.cell(statsTable, 1, 5, str.tostring(expectancy, "#.##"),   text_color=color.yellow)
+table.cell(statsTable, 2, 5, str.tostring(sharpe, "#.##"),       text_color=color.yellow)
+table.cell(statsTable, 3, 5, str.tostring(sortino, "#.##"),      text_color=color.yellow)
