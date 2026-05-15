@@ -1,0 +1,760 @@
+//@version=5
+strategy("External Signal Backtester (Auto-Optimize)", overlay=true, pyramiding=0, process_orders_on_close=true, max_bars_back=5000)
+
+// ╔═══════════════════════════════════════════════════════════╗
+// ║  EXTERNAL SIGNAL BACKTESTER WITH AUTO SL OPTIMIZER       ║
+// ║  - 3 exit modes: Opposite Signal, Fixed RR, External SL  ║
+// ║  - Auto-optimizer sweeps SELECTED SL mode params × R:R   ║
+// ║  - Optimizes for Net P&L, Profit Factor, or Win Rate     ║
+// ║                                                           ║
+// ║  ARCHITECTURE:                                            ║
+// ║  • Strategy engine always runs with MANUAL settings       ║
+// ║  • Optimizer is a SEPARATE simulation on the last bar     ║
+// ║  • When optimizer is ON, table shows optimizer results    ║
+// ║  • Optimizer only sweeps the selected SL mode's combos   ║
+// ╚═══════════════════════════════════════════════════════════╝
+
+// === External Signal Inputs ===
+buySrc1  = input.source(title="Buy Signal Source 1", defval=close)
+useBuy1  = input.bool(true, "Use Buy Signal 1")
+buySrc2  = input.source(title="Buy Signal Source 2", defval=close)
+useBuy2  = input.bool(false, "Use Buy Signal 2")
+buySrc3  = input.source(title="Buy Signal Source 3", defval=close)
+useBuy3  = input.bool(false, "Use Buy Signal 3")
+
+sellSrc1 = input.source(title="Sell Signal Source 1", defval=close)
+useSell1 = input.bool(true, "Use Sell Signal 1")
+sellSrc2 = input.source(title="Sell Signal Source 2", defval=close)
+useSell2 = input.bool(false, "Use Sell Signal 2")
+sellSrc3 = input.source(title="Sell Signal Source 3", defval=close)
+useSell3 = input.bool(false, "Use Sell Signal 3")
+
+// === Exit Mode ===
+exitMode = input.string("Opposite Signal", "Exit Mode", options=["Opposite Signal","Fixed RR","External SL/TP"])
+
+// === Manual Fixed RR Inputs ===
+slMode        = input.string("Candle Lookback", "Stop Loss Mode", options=["Candle Lookback","Swing High/Low","Moving Average","ATR","Support/Resistance"])
+rrInput       = input.float(2.0, "Risk/Reward", step=0.1)
+lookbackBars  = input.int(5, "Candle Lookback Bars")
+swingLen      = input.int(5, "Swing Length (bars)")
+swingMargin   = input.float(0.5, "Swing Margin (points)")
+pivotLeft     = input.int(2, "Pivot Left Bars")
+pivotRight    = input.int(2, "Pivot Right Bars")
+maType        = input.string("SMA", "MA Type", options=["SMA","EMA","WMA","VWMA","ALMA","HMA"])
+maLength      = input.int(20, "MA Length")
+pivotMargin   = input.float(0.5, "Pivot Margin (points)", step=0.1)
+maxPivots     = input.int(500, "Max Stored Pivots", minval=50)
+atrLength     = input.int(14, "ATR Length")
+atrMultiplier = input.float(1.5, "ATR Multiplier", step=0.1)
+
+// === External SL/TP Inputs ===
+extSlSrc = input.source(title="External SL Signal Source", defval=close)
+extTpSrc = input.source(title="External TP Signal Source", defval=close)
+
+// === Auto Optimizer Inputs ===
+autoOptimize = input.bool(false, "═══ Auto Optimize Stoploss ═══", group="Auto Optimizer")
+optCriteria  = input.string("Net P&L", "Optimize For", options=["Net P&L","Profit Factor","Win Rate"], group="Auto Optimizer")
+optMinRR     = input.float(1.0, "Minimum Risk/Reward", step=0.1, minval=0.5, group="Auto Optimizer")
+optMaxRR     = input.float(3.0, "Maximum Risk/Reward", step=0.1, minval=1.0, group="Auto Optimizer")
+optRRStep    = input.float(0.5, "R:R Step Size", step=0.1, minval=0.1, group="Auto Optimizer")
+
+// === Display ===
+maxTrades            = input.int(2, "Max Trades to Show (Arrows)", minval=1)
+useAllTradesForStats = input.bool(true, "Use All Trades for Stats")
+
+// ╔═══════════════════════════════════════════════════════════╗
+// ║  SIGNAL CONFLUENCE                                        ║
+// ╚═══════════════════════════════════════════════════════════╝
+enabledBuyCount  = (useBuy1 ? 1 : 0) + (useBuy2 ? 1 : 0) + (useBuy3 ? 1 : 0)
+enabledSellCount = (useSell1 ? 1 : 0) + (useSell2 ? 1 : 0) + (useSell3 ? 1 : 0)
+
+firedBuyCount  = (useBuy1 and ta.crossover(buySrc1, 0) ? 1 : 0) + (useBuy2 and ta.crossover(buySrc2, 0) ? 1 : 0) + (useBuy3 and ta.crossover(buySrc3, 0) ? 1 : 0)
+firedSellCount = (useSell1 and ta.crossover(sellSrc1, 0) ? 1 : 0) + (useSell2 and ta.crossover(sellSrc2, 0) ? 1 : 0) + (useSell3 and ta.crossover(sellSrc3, 0) ? 1 : 0)
+
+longEnabled     = enabledBuyCount > 0
+shortEnabled    = enabledSellCount > 0
+startLongTrade  = longEnabled and (firedBuyCount == enabledBuyCount)
+startShortTrade = shortEnabled and (firedSellCount == enabledSellCount)
+
+// ╔═══════════════════════════════════════════════════════════╗
+// ║  VARIABLES                                                ║
+// ╚═══════════════════════════════════════════════════════════╝
+var float stopPrice   = na
+var float targetPrice = na
+var float longQty     = 1.0
+var float shortQty    = 1.0
+var float longStop    = na
+var float shortStop   = na
+
+// ╔═══════════════════════════════════════════════════════════╗
+// ║  HELPER FUNCTIONS                                         ║
+// ╚═══════════════════════════════════════════════════════════╝
+f_ma(src, length, _maType) =>
+    ma = switch _maType
+        "SMA"  => ta.sma(src, length)
+        "EMA"  => ta.ema(src, length)
+        "WMA"  => ta.wma(src, length)
+        "VWMA" => ta.vwma(src, length)
+        "ALMA" => ta.alma(src, length, 0.85, 6)
+        "HMA"  => ta.hma(src, length)
+    ma
+
+f_lastPivotBefore(valsArr, barsArr) =>
+    float res = na
+    sz = array.size(barsArr)
+    if sz > 0
+        for k = 0 to sz - 1
+            i = sz - 1 - k
+            b = array.get(barsArr, i)
+            if b < bar_index
+                res := array.get(valsArr, i)
+                break
+    res
+
+// ╔═══════════════════════════════════════════════════════════╗
+// ║  MANUAL SL COMPUTATION (drives the strategy engine)       ║
+// ╚═══════════════════════════════════════════════════════════╝
+var float[] pivotHighVals = array.new_float()
+var int[]   pivotHighBars = array.new_int()
+var float[] pivotLowVals  = array.new_float()
+var int[]   pivotLowBars  = array.new_int()
+
+ph_manual = ta.pivothigh(high, pivotLeft, pivotRight)
+pl_manual = ta.pivotlow(low, pivotLeft, pivotRight)
+if not na(ph_manual)
+    array.push(pivotHighVals, ph_manual)
+    array.push(pivotHighBars, bar_index - pivotRight)
+if not na(pl_manual)
+    array.push(pivotLowVals, pl_manual)
+    array.push(pivotLowBars, bar_index - pivotRight)
+if array.size(pivotHighVals) > maxPivots
+    array.shift(pivotHighVals)
+    array.shift(pivotHighBars)
+if array.size(pivotLowVals) > maxPivots
+    array.shift(pivotLowVals)
+    array.shift(pivotLowBars)
+
+if exitMode == "Fixed RR"
+    if slMode == "Candle Lookback"
+        longStop  := ta.lowest(low, lookbackBars)
+        shortStop := ta.highest(high, lookbackBars)
+    else if slMode == "Swing High/Low"
+        longStop  := ta.lowest(low, swingLen) - swingMargin
+        shortStop := ta.highest(high, swingLen) + swingMargin
+    else if slMode == "Moving Average"
+        maValue = f_ma(close, maLength, maType)
+        longStop  := maValue
+        shortStop := maValue
+    else if slMode == "ATR"
+        atrVal = ta.atr(atrLength)
+        dist   = atrVal * atrMultiplier
+        longStop  := close - dist
+        shortStop := close + dist
+    else if slMode == "Support/Resistance"
+        lastPivotHigh = f_lastPivotBefore(pivotHighVals, pivotHighBars)
+        lastPivotLow  = f_lastPivotBefore(pivotLowVals, pivotLowBars)
+        longStop  := not na(lastPivotLow)  ? (lastPivotLow - pivotMargin)  : na
+        shortStop := not na(lastPivotHigh) ? (lastPivotHigh + pivotMargin) : na
+else
+    longStop  := na
+    shortStop := na
+
+// ╔═══════════════════════════════════════════════════════════╗
+// ║  ENTRY & EXIT LOGIC (strategy engine — uses MANUAL SL)    ║
+// ╚═══════════════════════════════════════════════════════════╝
+bool newEntryThisBar = false
+
+if exitMode == "Opposite Signal"
+    if startLongTrade and strategy.position_size == 0
+        strategy.entry("Long", strategy.long, qty=longQty)
+        newEntryThisBar := true
+    if startShortTrade and strategy.position_size == 0
+        strategy.entry("Short", strategy.short, qty=shortQty)
+        newEntryThisBar := true
+    longCloseSignal  = (useSell1 and ta.crossover(sellSrc1, 0)) or (useSell2 and ta.crossover(sellSrc2, 0)) or (useSell3 and ta.crossover(sellSrc3, 0))
+    shortCloseSignal = (useBuy1 and ta.crossover(buySrc1, 0)) or (useBuy2 and ta.crossover(buySrc2, 0)) or (useBuy3 and ta.crossover(buySrc3, 0))
+    if longCloseSignal and strategy.position_size > 0
+        strategy.close("Long")
+    if shortCloseSignal and strategy.position_size < 0
+        strategy.close("Short")
+
+if exitMode == "Fixed RR"
+    if startLongTrade and strategy.position_size == 0
+        stopPrice := longStop
+        if not na(stopPrice) and stopPrice < close
+            targetPrice := close + (close - stopPrice) * rrInput
+            strategy.entry("Long", strategy.long, qty=longQty)
+            strategy.exit("Long Exit", "Long", stop=stopPrice, limit=targetPrice)
+            newEntryThisBar := true
+        else
+            stopPrice   := na
+            targetPrice := na
+    if startShortTrade and strategy.position_size == 0
+        stopPrice := shortStop
+        if not na(stopPrice) and stopPrice > close
+            targetPrice := close - (stopPrice - close) * rrInput
+            strategy.entry("Short", strategy.short, qty=shortQty)
+            strategy.exit("Short Exit", "Short", stop=stopPrice, limit=targetPrice)
+            newEntryThisBar := true
+        else
+            stopPrice   := na
+            targetPrice := na
+
+if exitMode == "External SL/TP"
+    if startLongTrade and strategy.position_size == 0
+        strategy.entry("Long", strategy.long, qty=longQty)
+        newEntryThisBar := true
+    if startShortTrade and strategy.position_size == 0
+        strategy.entry("Short", strategy.short, qty=shortQty)
+        newEntryThisBar := true
+    extSlHit = ta.crossover(extSlSrc, 0)
+    extTpHit = ta.crossover(extTpSrc, 0)
+    if (extSlHit or extTpHit) and strategy.position_size != 0
+        string exitComment = extSlHit and extTpHit ? "Ext SL+TP" : extSlHit ? "Ext SL" : "Ext TP"
+        if strategy.position_size > 0
+            strategy.close("Long", comment = exitComment)
+        else if strategy.position_size < 0
+            strategy.close("Short", comment = exitComment)
+
+if strategy.position_size == 0 and not newEntryThisBar
+    stopPrice   := na
+    targetPrice := na
+
+// ╔═══════════════════════════════════════════════════════════╗
+// ║  VISUAL ELEMENTS                                          ║
+// ╚═══════════════════════════════════════════════════════════╝
+plot(stopPrice, "Stop Loss", color=color.red, style=plot.style_linebr)
+plot(targetPrice, "Target", color=color.green, style=plot.style_linebr)
+
+arrowLastIndex = strategy.closedtrades - 1
+var entryBarsArr = array.new_int()
+var exitBarsArr  = array.new_int()
+var int oldestArrowBar = na
+array.clear(entryBarsArr)
+array.clear(exitBarsArr)
+oldestArrowBar := na
+if strategy.closedtrades > 0
+    for n = 0 to math.min(arrowLastIndex, maxTrades - 1)
+        tradeIndex = arrowLastIndex - n
+        eBar = strategy.closedtrades.entry_bar_index(tradeIndex)
+        xBar = strategy.closedtrades.exit_bar_index(tradeIndex)
+        if eBar >= 0
+            array.push(entryBarsArr, eBar)
+            oldestArrowBar := na(oldestArrowBar) ? eBar : math.min(oldestArrowBar, eBar)
+        if xBar >= 0
+            array.push(exitBarsArr, xBar)
+            oldestArrowBar := na(oldestArrowBar) ? xBar : math.min(oldestArrowBar, xBar)
+bool inArrowRange = not na(oldestArrowBar) and bar_index >= oldestArrowBar
+plotshape(inArrowRange and array.includes(entryBarsArr, bar_index), title="Entry Arrow", style=shape.triangleup, location=location.belowbar, color=color.green, size=size.small, text="Entry")
+plotshape(inArrowRange and array.includes(exitBarsArr, bar_index), title="Exit Arrow", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small, text="Exit")
+
+// ╔═══════════════════════════════════════════════════════════╗
+// ║  PRE-COMPUTE SL CANDIDATES FOR OPTIMIZER                 ║
+// ║  Only compute values for the SELECTED SL mode.            ║
+// ║                                                           ║
+// ║  Combo counts per mode:                                   ║
+// ║    Candle Lookback: 5  (bars: 3,5,8,10,15)               ║
+// ║    Swing High/Low:  4  (len: 3,5,8,10; margin=0.5)       ║
+// ║    Moving Average:  9  (SMA/EMA/HMA × 10/20/50)          ║
+// ║    ATR:            16  (len 7/10/14/20 × mult 1/1.5/2/2.5)║
+// ║    Support/Resist:  9  (pivLR 2/3/5 × margin .25/.5/1)   ║
+// ╚═══════════════════════════════════════════════════════════╝
+
+// Number of combos for the selected mode — must be simple int (switch on input.string is simple)
+simple int NUM_COMBOS = switch slMode
+    "Candle Lookback"    => 5
+    "Swing High/Low"     => 4
+    "Moving Average"     => 9
+    "ATR"                => 16
+    "Support/Resistance" => 9
+    => 5
+
+// --- Candle Lookback: pre-compute 5 variants ---
+float cb_l_0 = ta.lowest(low, 3),   float cb_s_0 = ta.highest(high, 3)
+float cb_l_1 = ta.lowest(low, 5),   float cb_s_1 = ta.highest(high, 5)
+float cb_l_2 = ta.lowest(low, 8),   float cb_s_2 = ta.highest(high, 8)
+float cb_l_3 = ta.lowest(low, 10),  float cb_s_3 = ta.highest(high, 10)
+float cb_l_4 = ta.lowest(low, 15),  float cb_s_4 = ta.highest(high, 15)
+
+// --- Swing H/L: pre-compute 4 variants (margin=0.5) ---
+float sw_l_0 = ta.lowest(low, 3) - 0.5,   float sw_s_0 = ta.highest(high, 3) + 0.5
+float sw_l_1 = ta.lowest(low, 5) - 0.5,   float sw_s_1 = ta.highest(high, 5) + 0.5
+float sw_l_2 = ta.lowest(low, 8) - 0.5,   float sw_s_2 = ta.highest(high, 8) + 0.5
+float sw_l_3 = ta.lowest(low, 10) - 0.5,  float sw_s_3 = ta.highest(high, 10) + 0.5
+
+// --- MA: pre-compute 9 variants (SMA/EMA/HMA × 10/20/50) ---
+float ma_0 = ta.sma(close, 10), float ma_1 = ta.sma(close, 20), float ma_2 = ta.sma(close, 50)
+float ma_3 = ta.ema(close, 10), float ma_4 = ta.ema(close, 20), float ma_5 = ta.ema(close, 50)
+float ma_6 = ta.hma(close, 10), float ma_7 = ta.hma(close, 20), float ma_8 = ta.hma(close, 50)
+
+// --- ATR: pre-compute 4 ATR lengths (mult applied at sim time) ---
+float atr_7  = ta.atr(7),  float atr_10 = ta.atr(10)
+float atr_14 = ta.atr(14), float atr_20 = ta.atr(20)
+
+// --- S/R: pre-compute pivots for 3 LR values ---
+var float[] oph2v = array.new_float(), var int[] oph2b = array.new_int()
+var float[] opl2v = array.new_float(), var int[] opl2b = array.new_int()
+var float[] oph3v = array.new_float(), var int[] oph3b = array.new_int()
+var float[] opl3v = array.new_float(), var int[] opl3b = array.new_int()
+var float[] oph5v = array.new_float(), var int[] oph5b = array.new_int()
+var float[] opl5v = array.new_float(), var int[] opl5b = array.new_int()
+
+ph2 = ta.pivothigh(high, 2, 2), pl2 = ta.pivotlow(low, 2, 2)
+if not na(ph2)
+    array.push(oph2v, ph2), array.push(oph2b, bar_index - 2)
+if not na(pl2)
+    array.push(opl2v, pl2), array.push(opl2b, bar_index - 2)
+if array.size(oph2v) > maxPivots
+    array.shift(oph2v), array.shift(oph2b)
+if array.size(opl2v) > maxPivots
+    array.shift(opl2v), array.shift(opl2b)
+
+ph3 = ta.pivothigh(high, 3, 3), pl3 = ta.pivotlow(low, 3, 3)
+if not na(ph3)
+    array.push(oph3v, ph3), array.push(oph3b, bar_index - 3)
+if not na(pl3)
+    array.push(opl3v, pl3), array.push(opl3b, bar_index - 3)
+if array.size(oph3v) > maxPivots
+    array.shift(oph3v), array.shift(oph3b)
+if array.size(opl3v) > maxPivots
+    array.shift(opl3v), array.shift(opl3b)
+
+ph5 = ta.pivothigh(high, 5, 5), pl5 = ta.pivotlow(low, 5, 5)
+if not na(ph5)
+    array.push(oph5v, ph5), array.push(oph5b, bar_index - 5)
+if not na(pl5)
+    array.push(opl5v, pl5), array.push(opl5b, bar_index - 5)
+if array.size(oph5v) > maxPivots
+    array.shift(oph5v), array.shift(oph5b)
+if array.size(opl5v) > maxPivots
+    array.shift(opl5v), array.shift(opl5b)
+
+float sr_ph2 = f_lastPivotBefore(oph2v, oph2b), float sr_pl2 = f_lastPivotBefore(opl2v, opl2b)
+float sr_ph3 = f_lastPivotBefore(oph3v, oph3b), float sr_pl3 = f_lastPivotBefore(opl3v, opl3b)
+float sr_ph5 = f_lastPivotBefore(oph5v, oph5b), float sr_pl5 = f_lastPivotBefore(opl5v, opl5b)
+
+// ╔═══════════════════════════════════════════════════════════╗
+// ║  ENTRY SIGNAL CAPTURE FOR OPTIMIZER                       ║
+// ║  Only stores SL values for the SELECTED mode's combos.    ║
+// ║  Flat arrays: entry_i × NUM_COMBOS + combo_j              ║
+// ╚═══════════════════════════════════════════════════════════╝
+var int[]   sigBars     = array.new_int()
+var int[]   sigDirs     = array.new_int()
+var float[] sigPrices   = array.new_float()
+var float[] sigSL_long  = array.new_float()
+var float[] sigSL_short = array.new_float()
+// ATR values at entry (only used when slMode == "ATR")
+var float[] sigATR7     = array.new_float()
+var float[] sigATR10    = array.new_float()
+var float[] sigATR14    = array.new_float()
+var float[] sigATR20    = array.new_float()
+
+// Store all highs/lows for forward-walk simulation
+var float[] allHighs = array.new_float()
+var float[] allLows  = array.new_float()
+var int     firstBar = na
+if na(firstBar)
+    firstBar := bar_index
+array.push(allHighs, high)
+array.push(allLows, low)
+
+// Capture entry signals with SL values for the selected mode only
+if startLongTrade or startShortTrade
+    array.push(sigBars, bar_index)
+    array.push(sigDirs, startLongTrade ? 1 : -1)
+    array.push(sigPrices, close)
+
+    if slMode == "Candle Lookback"
+        // 5 combos: bars 3,5,8,10,15
+        array.push(sigSL_long, cb_l_0), array.push(sigSL_short, cb_s_0)
+        array.push(sigSL_long, cb_l_1), array.push(sigSL_short, cb_s_1)
+        array.push(sigSL_long, cb_l_2), array.push(sigSL_short, cb_s_2)
+        array.push(sigSL_long, cb_l_3), array.push(sigSL_short, cb_s_3)
+        array.push(sigSL_long, cb_l_4), array.push(sigSL_short, cb_s_4)
+
+    else if slMode == "Swing High/Low"
+        // 4 combos: len 3,5,8,10 margin=0.5
+        array.push(sigSL_long, sw_l_0), array.push(sigSL_short, sw_s_0)
+        array.push(sigSL_long, sw_l_1), array.push(sigSL_short, sw_s_1)
+        array.push(sigSL_long, sw_l_2), array.push(sigSL_short, sw_s_2)
+        array.push(sigSL_long, sw_l_3), array.push(sigSL_short, sw_s_3)
+
+    else if slMode == "Moving Average"
+        // 9 combos: SMA/EMA/HMA × 10/20/50
+        array.push(sigSL_long, ma_0), array.push(sigSL_short, ma_0)
+        array.push(sigSL_long, ma_1), array.push(sigSL_short, ma_1)
+        array.push(sigSL_long, ma_2), array.push(sigSL_short, ma_2)
+        array.push(sigSL_long, ma_3), array.push(sigSL_short, ma_3)
+        array.push(sigSL_long, ma_4), array.push(sigSL_short, ma_4)
+        array.push(sigSL_long, ma_5), array.push(sigSL_short, ma_5)
+        array.push(sigSL_long, ma_6), array.push(sigSL_short, ma_6)
+        array.push(sigSL_long, ma_7), array.push(sigSL_short, ma_7)
+        array.push(sigSL_long, ma_8), array.push(sigSL_short, ma_8)
+
+    else if slMode == "ATR"
+        // 16 combos: len 7/10/14/20 × mult 1.0/1.5/2.0/2.5
+        // SL is computed at sim time from stored ATR values, so push placeholders
+        for _x = 0 to 15
+            array.push(sigSL_long, 0.0), array.push(sigSL_short, 0.0)
+        array.push(sigATR7, atr_7), array.push(sigATR10, atr_10)
+        array.push(sigATR14, atr_14), array.push(sigATR20, atr_20)
+
+    else if slMode == "Support/Resistance"
+        // 9 combos: pivotLR 2/3/5 × margin 0.25/0.5/1.0
+        array.push(sigSL_long, not na(sr_pl2) ? sr_pl2 - 0.25 : na), array.push(sigSL_short, not na(sr_ph2) ? sr_ph2 + 0.25 : na)
+        array.push(sigSL_long, not na(sr_pl2) ? sr_pl2 - 0.5  : na), array.push(sigSL_short, not na(sr_ph2) ? sr_ph2 + 0.5  : na)
+        array.push(sigSL_long, not na(sr_pl2) ? sr_pl2 - 1.0  : na), array.push(sigSL_short, not na(sr_ph2) ? sr_ph2 + 1.0  : na)
+        array.push(sigSL_long, not na(sr_pl3) ? sr_pl3 - 0.25 : na), array.push(sigSL_short, not na(sr_ph3) ? sr_ph3 + 0.25 : na)
+        array.push(sigSL_long, not na(sr_pl3) ? sr_pl3 - 0.5  : na), array.push(sigSL_short, not na(sr_ph3) ? sr_ph3 + 0.5  : na)
+        array.push(sigSL_long, not na(sr_pl3) ? sr_pl3 - 1.0  : na), array.push(sigSL_short, not na(sr_ph3) ? sr_ph3 + 1.0  : na)
+        array.push(sigSL_long, not na(sr_pl5) ? sr_pl5 - 0.25 : na), array.push(sigSL_short, not na(sr_ph5) ? sr_ph5 + 0.25 : na)
+        array.push(sigSL_long, not na(sr_pl5) ? sr_pl5 - 0.5  : na), array.push(sigSL_short, not na(sr_ph5) ? sr_ph5 + 0.5  : na)
+        array.push(sigSL_long, not na(sr_pl5) ? sr_pl5 - 1.0  : na), array.push(sigSL_short, not na(sr_ph5) ? sr_ph5 + 1.0  : na)
+
+// ╔═══════════════════════════════════════════════════════════╗
+// ║  AUTO OPTIMIZER — self-contained simulation               ║
+// ║  Sweeps only the selected SL mode's combos × R:R steps.  ║
+// ║  Max combos: 16 (ATR) × R:R steps.                       ║
+// ╚═══════════════════════════════════════════════════════════╝
+var int    bestComboIdx  = -1
+var float  bestRR        = na
+var float  bestMetric    = na
+var string bestModeName  = ""
+var string bestParamStr  = ""
+var int    optWins       = 0
+var int    optLosses     = 0
+var int    optTotal      = 0
+var float  optNetPnL     = 0.0
+var float  optGainSum    = 0.0
+var float  optLossSum    = 0.0
+var float  optMaxGain    = 0.0
+var float  optMaxLoss    = 0.0
+
+if (barstate.islastconfirmedhistory or barstate.islast) and autoOptimize and exitMode == "Fixed RR"
+    int numEntries = array.size(sigBars)
+    int totalBarsStored = array.size(allHighs)
+
+    if numEntries > 0 and totalBarsStored > 0
+        float globalBestMetric = -1e18
+        int   globalBestCombo  = -1
+        float globalBestRR_val = na
+        int   gWins = 0, int gLosses = 0, int gTotal = 0
+        float gNetPnL = 0.0, float gGainSum = 0.0, float gLossSum = 0.0
+        float gMaxGain = 0.0, float gMaxLoss = 0.0
+
+        int rrSteps = math.floor((optMaxRR - optMinRR) / optRRStep) + 1
+
+        for rrIdx = 0 to rrSteps - 1
+            float currRR = optMinRR + rrIdx * optRRStep
+            if currRR > optMaxRR
+                break
+
+            for combo = 0 to NUM_COMBOS - 1
+                float simNetPnL  = 0.0
+                float simGainSum = 0.0
+                float simLossSum = 0.0
+                int   simWins    = 0
+                int   simLosses  = 0
+                int   simTotal   = 0
+                float simMaxGain = 0.0
+                float simMaxLoss = 0.0
+                int   simExitBar = -1
+
+                for e = 0 to numEntries - 1
+                    int   eBar   = array.get(sigBars, e)
+                    int   eDir   = array.get(sigDirs, e)
+                    float ePrice = array.get(sigPrices, e)
+
+                    // Pyramiding=0: skip if still in a trade
+                    if eBar <= simExitBar
+                        continue
+
+                    int slOff = e * NUM_COMBOS + combo
+                    float sl = na
+
+                    if slMode == "ATR"
+                        // ATR mode: compute SL from stored ATR values
+                        int atrLenIdx = math.floor(combo / 4)
+                        int multIdx   = combo % 4
+                        float av = atrLenIdx == 0 ? array.get(sigATR7, e) : atrLenIdx == 1 ? array.get(sigATR10, e) : atrLenIdx == 2 ? array.get(sigATR14, e) : array.get(sigATR20, e)
+                        float m  = multIdx == 0 ? 1.0 : multIdx == 1 ? 1.5 : multIdx == 2 ? 2.0 : 2.5
+                        sl := eDir == 1 ? ePrice - av * m : ePrice + av * m
+                    else
+                        // All other modes: read pre-stored SL value
+                        sl := eDir == 1 ? array.get(sigSL_long, slOff) : array.get(sigSL_short, slOff)
+
+                    bool validSL = not na(sl) and ((eDir == 1 and sl < ePrice) or (eDir == -1 and sl > ePrice))
+
+                    if validSL
+                        float slDist = math.abs(ePrice - sl)
+                        float tp = eDir == 1 ? ePrice + slDist * currRR : ePrice - slDist * currRR
+                        int eBarOff = eBar - firstBar
+                        float tradePnL = na
+                        int exitBarFound = -1
+                        int maxSrch = math.min(500, totalBarsStored - eBarOff - 1)
+
+                        if maxSrch > 0
+                            for b = 1 to maxSrch
+                                int idx = eBarOff + b
+                                if idx >= totalBarsStored
+                                    break
+                                float bH = array.get(allHighs, idx)
+                                float bL = array.get(allLows, idx)
+                                if eDir == 1
+                                    if bL <= sl
+                                        tradePnL := sl - ePrice
+                                        exitBarFound := firstBar + idx
+                                        break
+                                    if bH >= tp
+                                        tradePnL := tp - ePrice
+                                        exitBarFound := firstBar + idx
+                                        break
+                                else
+                                    if bH >= sl
+                                        tradePnL := ePrice - sl
+                                        exitBarFound := firstBar + idx
+                                        break
+                                    if bL <= tp
+                                        tradePnL := ePrice - tp
+                                        exitBarFound := firstBar + idx
+                                        break
+
+                        if not na(tradePnL)
+                            simTotal += 1
+                            simNetPnL += tradePnL
+                            simExitBar := exitBarFound
+                            if tradePnL > 0
+                                simWins    += 1
+                                simGainSum += tradePnL
+                                simMaxGain := math.max(simMaxGain, tradePnL)
+                            else if tradePnL < 0
+                                simLosses  += 1
+                                simLossSum += math.abs(tradePnL)
+                                simMaxLoss := math.min(simMaxLoss, tradePnL)
+
+                if simTotal > 0
+                    float metric = na
+                    if optCriteria == "Net P&L"
+                        metric := simNetPnL
+                    else if optCriteria == "Profit Factor"
+                        metric := simLossSum > 0 ? simGainSum / simLossSum : simGainSum > 0 ? 999.0 : 0.0
+                    else if optCriteria == "Win Rate"
+                        metric := simWins * 1.0 / simTotal * 100.0
+
+                    if not na(metric) and metric > globalBestMetric
+                        globalBestMetric := metric
+                        globalBestCombo  := combo
+                        globalBestRR_val := currRR
+                        gWins    := simWins
+                        gLosses  := simLosses
+                        gTotal   := simTotal
+                        gNetPnL  := simNetPnL
+                        gGainSum := simGainSum
+                        gLossSum := simLossSum
+                        gMaxGain := simMaxGain
+                        gMaxLoss := simMaxLoss
+
+        bestComboIdx := globalBestCombo
+        bestRR       := globalBestRR_val
+        bestMetric   := globalBestMetric
+        optWins      := gWins
+        optLosses    := gLosses
+        optTotal     := gTotal
+        optNetPnL    := gNetPnL
+        optGainSum   := gGainSum
+        optLossSum   := gLossSum
+        optMaxGain   := gMaxGain
+        optMaxLoss   := gMaxLoss
+
+        // Decode best combo to human-readable name based on the selected SL mode
+        if globalBestCombo >= 0
+            if slMode == "Candle Lookback"
+                int lb = globalBestCombo == 0 ? 3 : globalBestCombo == 1 ? 5 : globalBestCombo == 2 ? 8 : globalBestCombo == 3 ? 10 : 15
+                bestModeName := "Candle Lookback"
+                bestParamStr := "Bars: " + str.tostring(lb)
+            else if slMode == "Swing High/Low"
+                int sw = globalBestCombo == 0 ? 3 : globalBestCombo == 1 ? 5 : globalBestCombo == 2 ? 8 : 10
+                bestModeName := "Swing High/Low"
+                bestParamStr := "Len: " + str.tostring(sw) + " Margin: 0.5"
+            else if slMode == "Moving Average"
+                int maTypeIdx = math.floor(globalBestCombo / 3)
+                int maLenIdx  = globalBestCombo % 3
+                string maT = maTypeIdx == 0 ? "SMA" : maTypeIdx == 1 ? "EMA" : "HMA"
+                int maL = maLenIdx == 0 ? 10 : maLenIdx == 1 ? 20 : 50
+                bestModeName := "Moving Average"
+                bestParamStr := maT + " " + str.tostring(maL)
+            else if slMode == "ATR"
+                int atrLIdx = math.floor(globalBestCombo / 4)
+                int multIdx = globalBestCombo % 4
+                int aL = atrLIdx == 0 ? 7 : atrLIdx == 1 ? 10 : atrLIdx == 2 ? 14 : 20
+                float aM = multIdx == 0 ? 1.0 : multIdx == 1 ? 1.5 : multIdx == 2 ? 2.0 : 2.5
+                bestModeName := "ATR"
+                bestParamStr := "Len: " + str.tostring(aL) + " Mult: " + str.tostring(aM, "#.#")
+            else if slMode == "Support/Resistance"
+                int srLRIdx = math.floor(globalBestCombo / 3)
+                int srMIdx  = globalBestCombo % 3
+                int srLR = srLRIdx == 0 ? 2 : srLRIdx == 1 ? 3 : 5
+                float srM = srMIdx == 0 ? 0.25 : srMIdx == 1 ? 0.5 : 1.0
+                bestModeName := "Support/Resistance"
+                bestParamStr := "PivotLR: " + str.tostring(srLR) + " Margin: " + str.tostring(srM, "#.##")
+
+// ╔═══════════════════════════════════════════════════════════╗
+// ║  STATS TABLE                                              ║
+// ║  Auto-optimize ON + Fixed RR → optimizer sim stats        ║
+// ║  Otherwise → strategy engine's actual results             ║
+// ╚═══════════════════════════════════════════════════════════╝
+var table statsTable = na
+if na(statsTable)
+    statsTable := table.new(position.bottom_left, 4, 14, border_width=1)
+
+if barstate.islastconfirmedhistory or barstate.islast
+    bool showOptStats = autoOptimize and exitMode == "Fixed RR" and bestComboIdx >= 0
+
+    int   dTotal = 0, int dWins = 0, int dLosses = 0
+    float dNetGain = 0.0, float dGainSum = 0.0, float dLossSum = 0.0
+    float dMaxGain = 0.0, float dMaxLoss = 0.0
+
+    if showOptStats
+        dTotal   := optTotal
+        dWins    := optWins
+        dLosses  := optLosses
+        dNetGain := optNetPnL
+        dGainSum := optGainSum
+        dLossSum := -optLossSum
+        dMaxGain := optMaxGain
+        dMaxLoss := optMaxLoss
+    else
+        int loopCnt = useAllTradesForStats ? strategy.closedtrades : math.min(strategy.closedtrades, maxTrades)
+        int lastIdx = strategy.closedtrades - 1
+        if strategy.closedtrades > 0
+            for n = 0 to loopCnt - 1
+                tIdx = lastIdx - n
+                pl = strategy.closedtrades.profit(tIdx)
+                if not na(pl)
+                    dTotal += 1
+                    dNetGain += pl
+                    if pl > 0
+                        dWins += 1
+                        dGainSum += pl
+                        dMaxGain := math.max(dMaxGain, pl)
+                    else if pl < 0
+                        dLosses += 1
+                        dLossSum += pl
+                        dMaxLoss := math.min(dMaxLoss, pl)
+
+    float winRate      = dTotal > 0 ? (dWins * 1.0 / dTotal) * 100.0 : na
+    float winRateFrac  = dTotal > 0 ? (dWins * 1.0 / dTotal) : 0.0
+    float lossRateFrac = dTotal > 0 ? (dLosses * 1.0 / dTotal) : 0.0
+    float avgReturn    = dTotal > 0 ? (dNetGain / dTotal) : na
+    float profitFactor = dLossSum != 0 ? (dGainSum / math.abs(dLossSum)) : na
+    float avgWin       = dWins > 0 ? (dGainSum / dWins) : 0.0
+    float avgLossVal   = dLosses > 0 ? (math.abs(dLossSum) / dLosses) : 0.0
+    float expectancy   = dTotal > 0 ? (winRateFrac * avgWin) - (lossRateFrac * avgLossVal) : na
+
+    float sharpe = na, float sortino = na
+    if not showOptStats and strategy.closedtrades > 0
+        int lc2 = useAllTradesForStats ? strategy.closedtrades : math.min(strategy.closedtrades, maxTrades)
+        int li2 = strategy.closedtrades - 1
+        int rc = 0, float rs = 0.0, float wM2 = 0.0, float wMn = 0.0, float dsS = 0.0, int dsC = 0
+        for n = 0 to lc2 - 1
+            tIdx = li2 - n
+            pl = strategy.closedtrades.profit(tIdx)
+            te = strategy.closedtrades.entry_price(tIdx)
+            float pr = (not na(pl) and not na(te) and te != 0) ? (pl / te) * 100 : na
+            if not na(pr)
+                rc += 1
+                rs += pr
+                float d1 = pr - wMn
+                wMn := wMn + d1 / rc
+                float d2 = pr - wMn
+                wM2 := wM2 + d1 * d2
+                if pr < 0
+                    dsS += math.pow(pr, 2)
+                    dsC += 1
+        float mr = rc > 0 ? (rs / rc) : na
+        float v  = rc > 1 ? (wM2 / (rc - 1)) : 0.0
+        float sd = math.sqrt(v)
+        sharpe  := (not na(mr) and sd != 0) ? (mr / sd) : na
+        float dd = dsC > 0 ? math.sqrt(dsS / dsC) : na
+        sortino := (not na(mr) and not na(dd) and dd != 0) ? (mr / dd) : na
+
+    string scopeLabel = showOptStats ? ("OPTIMIZED — " + str.tostring(dTotal) + " Simulated Trades") : useAllTradesForStats ? ("All " + str.tostring(dTotal) + " Trades") : ("Last " + str.tostring(maxTrades) + " Trades")
+    color bannerColor = showOptStats ? #1a6b1a : color.gray
+
+    table.cell(statsTable, 0, 0, scopeLabel, text_color=color.white, bgcolor=bannerColor)
+    table.cell(statsTable, 1, 0, "", bgcolor=bannerColor)
+    table.cell(statsTable, 2, 0, "", bgcolor=bannerColor)
+    table.cell(statsTable, 3, 0, "", bgcolor=bannerColor)
+
+    table.cell(statsTable, 0, 1, "Win Rate %", text_color=color.white, bgcolor=color.black)
+    table.cell(statsTable, 1, 1, "Gain", text_color=color.white, bgcolor=color.black)
+    table.cell(statsTable, 2, 1, "Loss", text_color=color.white, bgcolor=color.black)
+    table.cell(statsTable, 3, 1, "Net Gain", text_color=color.white, bgcolor=color.black)
+    table.cell(statsTable, 0, 2, str.tostring(winRate, "#.##"), text_color=color.green)
+    table.cell(statsTable, 1, 2, str.tostring(dGainSum, "#.##"), text_color=color.green)
+    table.cell(statsTable, 2, 2, str.tostring(dLossSum, "#.##"), text_color=color.red)
+    table.cell(statsTable, 3, 2, str.tostring(dNetGain, "#.##"), text_color=color.yellow)
+
+    table.cell(statsTable, 0, 3, "Avg Return", text_color=color.white, bgcolor=color.black)
+    table.cell(statsTable, 1, 3, "Total Wins", text_color=color.white, bgcolor=color.black)
+    table.cell(statsTable, 2, 3, "Total Losses", text_color=color.white, bgcolor=color.black)
+    table.cell(statsTable, 3, 3, "Total Trades", text_color=color.white, bgcolor=color.black)
+    table.cell(statsTable, 0, 4, str.tostring(avgReturn, "#.##"), text_color=color.green)
+    table.cell(statsTable, 1, 4, str.tostring(dWins), text_color=color.green)
+    table.cell(statsTable, 2, 4, str.tostring(dLosses), text_color=color.red)
+    table.cell(statsTable, 3, 4, str.tostring(dTotal), text_color=color.yellow)
+
+    table.cell(statsTable, 0, 5, "Profit Factor", text_color=color.white, bgcolor=color.black)
+    table.cell(statsTable, 1, 5, "Expectancy", text_color=color.white, bgcolor=color.black)
+    table.cell(statsTable, 2, 5, "Sharpe", text_color=color.white, bgcolor=color.black)
+    table.cell(statsTable, 3, 5, "Sortino", text_color=color.white, bgcolor=color.black)
+    table.cell(statsTable, 0, 6, str.tostring(profitFactor, "#.##"), text_color=color.yellow)
+    table.cell(statsTable, 1, 6, str.tostring(expectancy, "#.##"), text_color=color.yellow)
+    table.cell(statsTable, 2, 6, str.tostring(sharpe, "#.##"), text_color=color.yellow)
+    table.cell(statsTable, 3, 6, str.tostring(sortino, "#.##"), text_color=color.yellow)
+
+    table.cell(statsTable, 0, 7, "Best Trade", text_color=color.white, bgcolor=color.black)
+    table.cell(statsTable, 1, 7, "Worst Trade", text_color=color.white, bgcolor=color.black)
+    table.cell(statsTable, 2, 7, "", bgcolor=color.black)
+    table.cell(statsTable, 3, 7, "", bgcolor=color.black)
+    table.cell(statsTable, 0, 8, str.tostring(dMaxGain, "#.##"), text_color=color.green)
+    table.cell(statsTable, 1, 8, str.tostring(dMaxLoss, "#.##"), text_color=color.red)
+    table.cell(statsTable, 2, 8, "")
+    table.cell(statsTable, 3, 8, "")
+
+    if showOptStats
+        table.cell(statsTable, 0, 9, "═ BEST CONFIG ═", text_color=color.white, bgcolor=#1a6b1a)
+        table.cell(statsTable, 1, 9, "", bgcolor=#1a6b1a)
+        table.cell(statsTable, 2, 9, "", bgcolor=#1a6b1a)
+        table.cell(statsTable, 3, 9, "", bgcolor=#1a6b1a)
+        table.cell(statsTable, 0, 10, "Mode", text_color=color.white, bgcolor=color.black)
+        table.cell(statsTable, 1, 10, "Params", text_color=color.white, bgcolor=color.black)
+        table.cell(statsTable, 2, 10, "R:R", text_color=color.white, bgcolor=color.black)
+        table.cell(statsTable, 3, 10, "Opt. For", text_color=color.white, bgcolor=color.black)
+        table.cell(statsTable, 0, 11, bestModeName, text_color=#00ff00)
+        table.cell(statsTable, 1, 11, bestParamStr, text_color=#00ff00)
+        table.cell(statsTable, 2, 11, str.tostring(bestRR, "#.#"), text_color=#00ff00)
+        table.cell(statsTable, 3, 11, optCriteria, text_color=#00ff00)
+        int totalCombos = NUM_COMBOS * (math.floor((optMaxRR - optMinRR) / optRRStep) + 1)
+        table.cell(statsTable, 0, 12, "Entries", text_color=color.white, bgcolor=color.black)
+        table.cell(statsTable, 1, 12, str.tostring(array.size(sigBars)), text_color=#00ff00)
+        table.cell(statsTable, 2, 12, "Combos", text_color=color.white, bgcolor=color.black)
+        table.cell(statsTable, 3, 12, str.tostring(totalCombos), text_color=#00ff00)
+    else if autoOptimize and exitMode == "Fixed RR"
+        table.cell(statsTable, 0, 9, "═ OPTIMIZER ═", text_color=color.white, bgcolor=color.maroon)
+        table.cell(statsTable, 1, 9, "No valid", bgcolor=color.maroon, text_color=color.white)
+        table.cell(statsTable, 2, 9, "combos", bgcolor=color.maroon, text_color=color.white)
+        table.cell(statsTable, 3, 9, "found", bgcolor=color.maroon, text_color=color.white)
+    else if exitMode != "Fixed RR" and (exitMode == "Opposite Signal" or exitMode == "External SL/TP")
+        // Show note that SL settings are inactive
+        table.cell(statsTable, 0, 9, "SL settings inactive", text_color=color.gray)
+        table.cell(statsTable, 1, 9, "in " + exitMode, text_color=color.gray)
+        table.cell(statsTable, 2, 9, "mode", text_color=color.gray)
+        table.cell(statsTable, 3, 9, "")
+        for r = 10 to 12
+            for c = 0 to 3
+                table.cell(statsTable, c, r, "")
+    else
+        for r = 9 to 12
+            for c = 0 to 3
+                table.cell(statsTable, c, r, "")
